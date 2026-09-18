@@ -1,0 +1,11 @@
+[package]
+name = "Billing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+artisan_middleware = { path = "../artisan_lib" }
+serde = "1.0.219"
+serde_json = "1.0.140"
+tokio = "1.44.2"
+warp = "0.3.7"
