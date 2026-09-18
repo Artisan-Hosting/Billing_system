@@ -26,7 +26,7 @@ async fn main() {
 
             // do the math
             let costs: BillingCosts = calculate_costs(&usage, params.instances);
-            log!(LogLevel::Info, "\nBill generated for {}: \n{}", usage.runner_id, costs);
+            log!(LogLevel::Info, "\nBill generated for {}: \n{}", usage.project_id, costs);
 
             // wrap in your ApiResponse
             let resp: ApiResponse<BillingCosts> = ApiResponse {
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn test_calculate_costs_minimum() {
         let usage = BilledUsageSummary {
-            runner_id: "r".into(),
+            project_id: "r".into(),
             instance_id: "i".into(),
             total_cpu: 0.0,
             peak_cpu: 0.0,
@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn test_calculate_costs_scaled() {
         let usage = BilledUsageSummary {
-            runner_id: "r".into(),
+            project_id: "r".into(),
             instance_id: "i".into(),
             total_cpu: 3600.0, // means ~100% CPU for 1 hour
             peak_cpu: 100.0,
