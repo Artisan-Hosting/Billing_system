@@ -38,7 +38,7 @@ the implementation can proceed in the order at the bottom.
 ## Data model additions
 
 - `billing_customers(organization_id PK, stripe_customer_id UNIQUE,
-  default_payment_method_id NULL, tax_status, created_at, updated_at)`.
+  default_payment_method_id NULL, created_at, updated_at)`.
   One row per organization. Created with the organization (or lazily on the
   first billing action); the Stripe Customer carries
   `metadata[organization_id]` so any webhook can be mapped back.
@@ -55,7 +55,7 @@ the implementation can proceed in the order at the bottom.
 
 ### Subscribe / upgrade / downgrade / cancel
 - Subscribe: Stripe Checkout in `subscription` mode for the org's Customer
-  (collects card + billing address for tax, and saves the card). Returns a
+  (collects and saves the card and billing details). Returns a
   Checkout URL instead of a PaymentIntent client secret.
 - Upgrade: update the Stripe Subscription item, `proration_behavior=
   create_prorations`. Downgrade: schedule at period end.
@@ -75,7 +75,7 @@ the implementation can proceed in the order at the bottom.
 - Local ledger stays (`credit_accounts`, `credit_ledger_entries`): per-second
   debits are far too frequent for Stripe's API.
 - Top-up: Checkout `payment` mode (or PaymentIntent) against the same
-  Customer, `setup_future_usage=off_session`, tax enabled.
+  Customer, `setup_future_usage=off_session`.
 - On `payment_intent.succeeded` / `checkout.session.completed` for a top-up,
   write a `topup` ledger entry with `idempotency_key = payment_intent id`, in
   the same transaction that records the payment status.
@@ -85,7 +85,7 @@ the implementation can proceed in the order at the bottom.
   off-session; on failure alert the org and stop new GPU sessions.
 
 ### Customer self-service
-- Stripe Billing Portal for card updates, invoices/receipts, tax IDs and
+- Stripe Billing Portal for card updates, invoices/receipts and
   cancellation.
 
 ## Webhooks to handle
@@ -93,7 +93,7 @@ the implementation can proceed in the order at the bottom.
 `customer.subscription.{created,updated,deleted}`, `invoice.created`,
 `invoice.finalized`, `invoice.paid`, `invoice.payment_failed`,
 `payment_intent.{succeeded,payment_failed}`, `checkout.session.completed`,
-`charge.refunded`, `charge.dispute.created`, `customer.updated` (tax/address).
+`charge.refunded`, `charge.dispute.created`, `customer.updated`.
 Every event is recorded in `stripe_events` first; handlers are idempotent.
 
 ## Pricing model findings (from Artisan_Pricing_Model.xlsx)
