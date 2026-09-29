@@ -107,15 +107,17 @@ has to respect or the spreadsheet does not yet cover:
   writing -- confirm current pricing). Add it to `Inputs` so the margins on
   the small plans (Builder $8, Mail Starter $12) are honest. $0 invoices
   (Beta) incur no percentage fee.
-- **GPU credits are integer cents, but GPU rates are far below a cent per
-  second.** A T4 at $0.30/hr is 0.0083 cents/second, and `DebitCredit` is
-  specified as roughly one debit per second per session with a positive
-  integer `amount_cents`. Rounding each tick up over- or under-charges badly.
-  Fix before GPU launch: either meter in a finer unit (e.g. micro-dollars in
-  `balance_*` / `amount_*`), or have RunpodManager accumulate the fractional
-  remainder and debit in whole cents (carrying the remainder), or debit per
-  minute rather than per second. Recommendation: keep the ledger in a finer
-  unit -- it keeps `DebitCredit` idempotent and lossless.
+- **GPU credits: ledger is now micro-dollars, and Billing owns the markup
+  (implemented).** GPU rates are far below a cent per second (a $0.30/hr T4
+  is ~0.0083 cents/s), so the ledger (`balance_micros`, `amount_micros`;
+  1 USD = 1,000,000, 1 cent = 10,000) is finer than Stripe's cents. Stripe
+  amounts convert at the boundary (`credit::cents_to_micros`). RunpodManager
+  sends the **raw Runpod cost per hour** plus the session duration; Billing
+  applies `credits.markup_percent` (135) and rounds the hourly price up to
+  `credits.rate_round_up_step_cents` (5), then prices the slice of time
+  (`src/credit.rs`; unit-tested against every GPU on the spreadsheet). The
+  caller must not mark up first or the customer is charged twice.
+
 - **GPU margin is small in absolute terms** (10 h/mo sold = $1.60). The $25
   minimum top-up already keeps the Stripe fixed fee (~4%) well below the
   ~26% gross margin; keep that floor.
@@ -135,8 +137,6 @@ has to respect or the spreadsheet does not yet cover:
 - Grace period / suspension policy after `invoice.payment_failed` retries are
   exhausted (maps to the existing `PastDue -> GracePeriod -> Suspended ->
   Deleted` states).
-- Credit unit (see the GPU finding above): micro-dollars vs. carrying
-  remainders in RunpodManager.
 - Whether credits expire, are refundable, or can go negative (currently
   `DebitCredit` may leave a negative balance by design).
 - How an admin issues a manual $0 (or comped) invoice for Beta orgs: Stripe
@@ -144,6 +144,9 @@ has to respect or the spreadsheet does not yet cover:
 
 ## Implementation order
 
+0. **Done:** credit ledger in micro-dollars, Billing-owned GPU markup
+   (`DebitCredit` / `PreflightCreditCheck` now take the raw Runpod cost,
+   migration `0008_credit_micros.sql`).
 1. Create the Stripe Customer at organization creation (hook or RPC called by
    whatever creates the org), plus a migration for `billing_customers`, plan Price IDs, `stripe_subscription_id`,
    `stripe_events`; Stripe client gains Customer / Checkout / Portal /

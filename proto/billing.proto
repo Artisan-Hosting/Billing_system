@@ -406,11 +406,18 @@ message GetCreditBalanceRequest {
 
 message CreditBalance {
   string organization_id = 1;
+  // Derived display values, whole cents rounded toward negative infinity.
+  // The ledger itself is in micro-dollars -- see `balance_micros`.
   int64 balance_cents = 2;
-  // 0 means no cap configured, matching `credit_accounts.monthly_spend_cap_cents`
+  // 0 means no cap configured, matching `credit_accounts.monthly_spend_cap_micros`
   // being NULLable -- a real cap of exactly $0 is not a state this system
   // has any use for (it would mean "can never spend anything").
   int64 monthly_spend_cap_cents = 3;
+  // The source of truth: micro-dollars (1 USD = 1,000,000; 1 cent = 10,000).
+  // GPU rates are far below a cent per second, so whole cents cannot
+  // represent a metering tick. May be negative (see DebitCredit).
+  int64 balance_micros = 4;
+  int64 monthly_spend_cap_micros = 5;
 }
 
 message TopUpCreditRequest {
@@ -421,20 +428,38 @@ message TopUpCreditRequest {
   string elevated_token = 5;
 }
 
+// Billing owns the GPU markup: the caller sends the raw Runpod cost and how
+// long the session ran, and Billing prices it (cost x markup, hourly price
+// rounded up -- see `[credits]` in billing.json and src/credit.rs). The
+// caller must NOT apply its own markup first or the customer is charged twice.
 message DebitCreditRequest {
   string organization_id = 1;
-  int64 amount_cents = 2;         // positive; this RPC always debits, never credits
+  reserved 2;                     // was amount_cents
+  reserved "amount_cents";
   string external_reference = 3;  // the Runpod session id this debit metered
   string idempotency_key = 4;
+  // Runpod's own cost for this GPU, micro-dollars per hour ($0.44/hr = 440000).
+  int64 runpod_cost_micros_per_hour = 5;
+  // How much session time this debit covers, in milliseconds (positive).
+  int64 duration_ms = 6;
 }
 
 message PreflightCreditCheckRequest {
   string organization_id = 1;
-  int64 hourly_rate_cents = 2;   // the marked-up customer rate, already computed by the caller
-  double min_hours_required = 3; // Price Book default: 1.0
+  reserved 2;                    // was hourly_rate_cents
+  reserved "hourly_rate_cents";
+  double min_hours_required = 3; // <= 0 means the Price Book default of 1.0
+  // Runpod's own (un-marked-up) cost, micro-dollars per hour; Billing
+  // applies the markup, same as DebitCredit.
+  int64 runpod_cost_micros_per_hour = 4;
 }
 
 message PreflightCreditCheckResponse {
   bool sufficient = 1;
   int64 balance_cents = 2;   // for the caller's own logging/UI, not itself the pass/fail signal
+  int64 balance_micros = 3;
+  // What Billing will charge the customer per hour for this GPU.
+  int64 customer_rate_micros_per_hour = 4;
+  // customer rate x min_hours_required, rounded up.
+  int64 required_micros = 5;
 }

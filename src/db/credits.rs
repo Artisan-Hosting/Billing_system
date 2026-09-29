@@ -1,7 +1,7 @@
 //! Queries behind `credit_accounts`/`credit_ledger_entries` (see
 //! `migrations/0006_credit_ledger.sql`, `0007_credit_ledger_idempotency.sql`).
 //!
-//! `credit_accounts.balance_cents` is a materialized column kept in sync
+//! `credit_accounts.balance_micros` (micro-dollars, see [`crate::credit`]) is a materialized column kept in sync
 //! with the append-only `credit_ledger_entries` inside the same transaction
 //! as every write -- see [`apply_ledger_entry`]'s own doc comment.
 
@@ -12,8 +12,8 @@ use crate::error::Result;
 #[derive(Debug, Clone)]
 pub struct CreditAccountRow {
     pub organization_id: String,
-    pub balance_cents: i64,
-    pub monthly_spend_cap_cents: Option<i64>,
+    pub balance_micros: i64,
+    pub monthly_spend_cap_micros: Option<i64>,
     pub updated_at: i64,
 }
 
@@ -29,7 +29,7 @@ pub async fn get_or_create(pool: &MySqlPool, organization_id: &str) -> Result<Cr
         .await?;
 
     let row = sqlx::query(
-        "SELECT organization_id, balance_cents, monthly_spend_cap_cents, \
+        "SELECT organization_id, balance_micros, monthly_spend_cap_micros, \
          UNIX_TIMESTAMP(updated_at) AS updated_at FROM credit_accounts WHERE organization_id = ?",
     )
     .bind(organization_id)
@@ -38,8 +38,8 @@ pub async fn get_or_create(pool: &MySqlPool, organization_id: &str) -> Result<Cr
 
     Ok(CreditAccountRow {
         organization_id: row.get("organization_id"),
-        balance_cents: row.get("balance_cents"),
-        monthly_spend_cap_cents: row.get("monthly_spend_cap_cents"),
+        balance_micros: row.get("balance_micros"),
+        monthly_spend_cap_micros: row.get("monthly_spend_cap_micros"),
         updated_at: row.get("updated_at"),
     })
 }
@@ -51,7 +51,7 @@ pub async fn get_or_create(pool: &MySqlPool, organization_id: &str) -> Result<Cr
 /// `idempotency_key`, when given, makes a retried call land once: a second
 /// call with the same `(organization_id, idempotency_key)` is detected via
 /// the table's unique key and returns the balance *unchanged* rather than
-/// applying the entry twice. Returns `(new_balance_cents, applied)`, where
+/// applying the entry twice. Returns `(new_balance_micros, applied)`, where
 /// `applied` is `false` on a detected retry -- callers that need to know
 /// "did this debit actually happen" (vs. "we already knew about it") can
 /// tell the two apart.
@@ -59,7 +59,7 @@ pub async fn apply_ledger_entry(
     pool: &MySqlPool,
     organization_id: &str,
     entry_type: &str,
-    amount_cents: i64,
+    amount_micros: i64,
     external_reference: Option<&str>,
     idempotency_key: Option<&str>,
 ) -> Result<(i64, bool)> {
@@ -72,37 +72,37 @@ pub async fn apply_ledger_entry(
 
     if let Some(key) = idempotency_key {
         let existing: Option<i64> = sqlx::query_scalar(
-            "SELECT balance_after_cents FROM credit_ledger_entries WHERE organization_id = ? AND idempotency_key = ?",
+            "SELECT balance_after_micros FROM credit_ledger_entries WHERE organization_id = ? AND idempotency_key = ?",
         )
         .bind(organization_id)
         .bind(key)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some(balance_after_cents) = existing {
+        if let Some(balance_after_micros) = existing {
             tx.commit().await?;
-            return Ok((balance_after_cents, false));
+            return Ok((balance_after_micros, false));
         }
     }
 
-    sqlx::query("UPDATE credit_accounts SET balance_cents = balance_cents + ? WHERE organization_id = ?")
-        .bind(amount_cents)
+    sqlx::query("UPDATE credit_accounts SET balance_micros = balance_micros + ? WHERE organization_id = ?")
+        .bind(amount_micros)
         .bind(organization_id)
         .execute(&mut *tx)
         .await?;
 
-    let new_balance: i64 = sqlx::query_scalar("SELECT balance_cents FROM credit_accounts WHERE organization_id = ?")
+    let new_balance: i64 = sqlx::query_scalar("SELECT balance_micros FROM credit_accounts WHERE organization_id = ?")
         .bind(organization_id)
         .fetch_one(&mut *tx)
         .await?;
 
     sqlx::query(
         "INSERT INTO credit_ledger_entries \
-         (organization_id, entry_type, amount_cents, external_reference, idempotency_key, balance_after_cents) \
+         (organization_id, entry_type, amount_micros, external_reference, idempotency_key, balance_after_micros) \
          VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(organization_id)
     .bind(entry_type)
-    .bind(amount_cents)
+    .bind(amount_micros)
     .bind(external_reference)
     .bind(idempotency_key)
     .bind(new_balance)
@@ -129,8 +129,8 @@ mod tests {
         let org = unique_org();
 
         let account = get_or_create(&pool, &org).await.expect("get_or_create");
-        assert_eq!(account.balance_cents, 0);
-        assert_eq!(account.monthly_spend_cap_cents, None);
+        assert_eq!(account.balance_micros, 0);
+        assert_eq!(account.monthly_spend_cap_micros, None);
     }
 
     #[tokio::test]
@@ -149,7 +149,7 @@ mod tests {
         assert!(applied);
 
         let account = get_or_create(&pool, &org).await.expect("get_or_create");
-        assert_eq!(account.balance_cents, 1500, "the materialized column must match the ledger's running total");
+        assert_eq!(account.balance_micros, 1500, "the materialized column must match the ledger's running total");
     }
 
     #[tokio::test]
@@ -173,7 +173,7 @@ mod tests {
         assert!(!applied_retry);
 
         let account = get_or_create(&pool, &org).await.expect("get_or_create");
-        assert_eq!(account.balance_cents, 4900);
+        assert_eq!(account.balance_micros, 4900);
     }
 
     #[tokio::test]

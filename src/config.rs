@@ -26,11 +26,18 @@ pub struct Config {
     pub http: Http,
     pub auth: Auth,
     pub purchasing: Purchasing,
+    pub credits: Credits,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { grpc: Grpc::default(), http: Http::default(), auth: Auth::default(), purchasing: Purchasing::default() }
+        Self {
+            grpc: Grpc::default(),
+            http: Http::default(),
+            auth: Auth::default(),
+            purchasing: Purchasing::default(),
+            credits: Credits::default(),
+        }
     }
 }
 
@@ -75,6 +82,24 @@ pub struct Purchasing {
 impl Default for Purchasing {
     fn default() -> Self {
         Self { enabled: false }
+    }
+}
+
+/// GPU credit pricing: the markup billing applies to the raw Runpod cost the
+/// session manager hands it (see [`crate::credit`]). Defaults are Price Book
+/// v1 (cost x 1.35, hourly price rounded up to $0.05).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Credits {
+    /// Customer price as a percentage of cost: 135 means cost x 1.35.
+    pub markup_percent: u32,
+    /// The hourly price is rounded up to a multiple of this many cents.
+    pub rate_round_up_step_cents: u32,
+}
+
+impl Default for Credits {
+    fn default() -> Self {
+        Self { markup_percent: 135, rate_round_up_step_cents: 5 }
     }
 }
 

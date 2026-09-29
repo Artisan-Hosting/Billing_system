@@ -22,5 +22,12 @@
     // Kill switch for the two money-moving RPCs (CreateOrUpgradeSubscription,
     // TopUpCredit). Leave this false until purchasing is ready to go live.
     "enabled": false
+  },
+  "credits": {
+    // GPU markup applied to the raw Runpod cost RunpodManager sends with each
+    // debit/preflight: 135 = cost x 1.35 (Price Book v1).
+    "markup_percent": 135,
+    // The marked-up hourly price is rounded UP to a multiple of this many cents.
+    "rate_round_up_step_cents": 5
   }
 }

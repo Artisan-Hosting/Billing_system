@@ -571,11 +571,7 @@ impl BillingAdminService for Billing {
         let organization_id = self.scoped_org(&claims, &req.organization_id)?;
 
         let account = credits_db::get_or_create(&self.pool, &organization_id).await.map_err(Status::from)?;
-        Ok(Response::new(CreditBalance {
-            organization_id: account.organization_id,
-            balance_cents: account.balance_cents,
-            monthly_spend_cap_cents: account.monthly_spend_cap_cents.unwrap_or(0),
-        }))
+        Ok(Response::new(credit_balance_to_proto(account)))
     }
 
     /// AUTHZ: Action::Purchase on the `subscription` resource type **and**
@@ -636,23 +632,27 @@ impl BillingAdminService for Billing {
         if req.organization_id.is_empty() {
             return Err(Status::invalid_argument("organization_id is required"));
         }
-        if req.amount_cents <= 0 {
-            return Err(Status::invalid_argument("amount_cents must be a positive number of minor units to debit"));
+
+        let rate = self.customer_rate_micros_per_hour(req.runpod_cost_micros_per_hour)?;
+        let amount_micros = crate::credit::debit_micros(rate, req.duration_ms)
+            .ok_or_else(|| Status::invalid_argument("duration_ms must be positive"))?;
+        // A duration so short it rounds to zero micros is a no-op tick, not an
+        // error -- and not a ledger row either (a zero-amount entry would
+        // also burn its idempotency key).
+        if amount_micros == 0 {
+            let account = credits_db::get_or_create(&self.pool, &req.organization_id).await.map_err(Status::from)?;
+            return Ok(Response::new(credit_balance_to_proto(account)));
         }
 
         let idempotency_key = if req.idempotency_key.is_empty() { None } else { Some(req.idempotency_key.as_str()) };
         let external_reference = if req.external_reference.is_empty() { None } else { Some(req.external_reference.as_str()) };
 
-        credits_db::apply_ledger_entry(&self.pool, &req.organization_id, "debit", -req.amount_cents, external_reference, idempotency_key)
+        credits_db::apply_ledger_entry(&self.pool, &req.organization_id, "debit", -amount_micros, external_reference, idempotency_key)
             .await
             .map_err(Status::from)?;
 
         let account = credits_db::get_or_create(&self.pool, &req.organization_id).await.map_err(Status::from)?;
-        Ok(Response::new(CreditBalance {
-            organization_id: account.organization_id,
-            balance_cents: account.balance_cents,
-            monthly_spend_cap_cents: account.monthly_spend_cap_cents.unwrap_or(0),
-        }))
+        Ok(Response::new(credit_balance_to_proto(account)))
     }
 
     async fn preflight_credit_check(
@@ -664,13 +664,43 @@ impl BillingAdminService for Billing {
             return Err(Status::invalid_argument("organization_id is required"));
         }
 
-        let required_cents = (req.hourly_rate_cents as f64 * req.min_hours_required).ceil() as i64;
+        let rate = self.customer_rate_micros_per_hour(req.runpod_cost_micros_per_hour)?;
+        let min_hours = if req.min_hours_required > 0.0 { req.min_hours_required } else { 1.0 };
+        let required_micros = crate::credit::required_micros(rate, min_hours)
+            .ok_or_else(|| Status::invalid_argument("min_hours_required is out of range"))?;
         let account = credits_db::get_or_create(&self.pool, &req.organization_id).await.map_err(Status::from)?;
 
         Ok(Response::new(PreflightCreditCheckResponse {
-            sufficient: account.balance_cents >= required_cents,
-            balance_cents: account.balance_cents,
+            sufficient: account.balance_micros >= required_micros,
+            balance_cents: crate::credit::micros_to_cents_floor(account.balance_micros),
+            balance_micros: account.balance_micros,
+            customer_rate_micros_per_hour: rate,
+            required_micros,
         }))
+    }
+}
+
+impl Billing {
+    /// The customer's hourly price for a GPU with the given raw Runpod cost:
+    /// the configured markup, rounded up to the configured step.
+    fn customer_rate_micros_per_hour(&self, runpod_cost_micros_per_hour: i64) -> Result<i64, Status> {
+        let credits = &self.config.credits;
+        crate::credit::customer_rate_micros_per_hour(
+            runpod_cost_micros_per_hour,
+            credits.markup_percent,
+            crate::credit::cents_to_micros(credits.rate_round_up_step_cents as i64),
+        )
+        .ok_or_else(|| Status::invalid_argument("runpod_cost_micros_per_hour must be positive"))
+    }
+}
+
+fn credit_balance_to_proto(account: credits_db::CreditAccountRow) -> CreditBalance {
+    CreditBalance {
+        organization_id: account.organization_id,
+        balance_cents: crate::credit::micros_to_cents_floor(account.balance_micros),
+        monthly_spend_cap_cents: account.monthly_spend_cap_micros.map(crate::credit::micros_to_cents_floor).unwrap_or(0),
+        balance_micros: account.balance_micros,
+        monthly_spend_cap_micros: account.monthly_spend_cap_micros.unwrap_or(0),
     }
 }
 
@@ -708,7 +738,11 @@ mod tests {
             stripe_webhook_secret: String::new(),
             stripe_publishable_key: String::new(),
         };
-        Billing::new(Config::default(), secrets, pool).expect("construct Billing")
+        // Plaintext, so construction doesn't need the mTLS client cert files an
+        // `https://` ais_auth address (the default) reads from disk. Never dialed.
+        let mut config = Config::default();
+        config.auth.grpc_addr = "http://127.0.0.1:50051".to_owned();
+        Billing::new(config, secrets, pool).expect("construct Billing")
     }
 
     /// Requires a real, migrated database (`DATABASE_URL`) -- `cargo test --
@@ -767,49 +801,74 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn debit_credit_through_the_real_handler_applies_and_reports_the_new_balance() {
+    async fn debit_credit_through_the_real_handler_prices_the_session_and_reports_the_new_balance() {
         let database_url = std::env::var("DATABASE_URL").expect("set DATABASE_URL to a migrated test database");
         let pool = crate::db::connect(&database_url).await.expect("connect");
         let billing = test_billing(pool.clone()).await;
         let org = unique_org();
 
-        credits_db::apply_ledger_entry(&pool, &org, "topup", 5000, None, None).await.expect("seed a balance");
+        // $25.00 on hand, in micro-dollars.
+        credits_db::apply_ledger_entry(&pool, &org, "topup", 25_000_000, None, None).await.expect("seed a balance");
 
-        let req = Request::new(DebitCreditRequest {
-            organization_id: org.clone(),
-            amount_cents: 750,
-            external_reference: "session-abc".to_owned(),
-            idempotency_key: "session-abc:1".to_owned(),
-        });
-        let balance = billing.debit_credit(req).await.expect("debit_credit").into_inner();
-        assert_eq!(balance.balance_cents, 4250);
+        // A 4090 costs $0.44/hr; at the default 1.35x markup rounded up to
+        // $0.05 that lists at $0.60/hr, so one hour debits 600_000 micros.
+        let debit = || {
+            Request::new(DebitCreditRequest {
+                organization_id: org.clone(),
+                external_reference: "session-abc".to_owned(),
+                idempotency_key: "session-abc:1".to_owned(),
+                runpod_cost_micros_per_hour: 440_000,
+                duration_ms: 3_600_000,
+            })
+        };
+        let balance = billing.debit_credit(debit()).await.expect("debit_credit").into_inner();
+        assert_eq!(balance.balance_micros, 24_400_000);
+        assert_eq!(balance.balance_cents, 2_440);
 
         // A retried call with the same idempotency key must not double-debit.
-        let req = Request::new(DebitCreditRequest {
-            organization_id: org.clone(),
-            amount_cents: 750,
-            external_reference: "session-abc".to_owned(),
-            idempotency_key: "session-abc:1".to_owned(),
-        });
-        let balance = billing.debit_credit(req).await.expect("retried debit_credit").into_inner();
-        assert_eq!(balance.balance_cents, 4250, "retried debit must not apply twice");
+        let balance = billing.debit_credit(debit()).await.expect("retried debit_credit").into_inner();
+        assert_eq!(balance.balance_micros, 24_400_000, "retried debit must not apply twice");
     }
 
     #[tokio::test]
     #[ignore]
-    async fn debit_credit_rejects_a_non_positive_amount() {
+    async fn a_one_second_tick_on_a_cheap_gpu_is_charged_not_rounded_to_zero() {
+        let database_url = std::env::var("DATABASE_URL").expect("set DATABASE_URL to a migrated test database");
+        let pool = crate::db::connect(&database_url).await.expect("connect");
+        let billing = test_billing(pool.clone()).await;
+        let org = unique_org();
+        credits_db::apply_ledger_entry(&pool, &org, "topup", 1_000_000, None, None).await.expect("seed a balance");
+
+        // T4: $0.20/hr cost -> $0.30/hr list -> 83 micros for one second.
+        let req = Request::new(DebitCreditRequest {
+            organization_id: org,
+            external_reference: "session-t4".to_owned(),
+            idempotency_key: "session-t4:1".to_owned(),
+            runpod_cost_micros_per_hour: 200_000,
+            duration_ms: 1_000,
+        });
+        let balance = billing.debit_credit(req).await.expect("debit_credit").into_inner();
+        assert_eq!(balance.balance_micros, 1_000_000 - 83);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn debit_credit_rejects_a_non_positive_duration_or_cost() {
         let database_url = std::env::var("DATABASE_URL").expect("set DATABASE_URL to a migrated test database");
         let pool = crate::db::connect(&database_url).await.expect("connect");
         let billing = test_billing(pool).await;
 
-        let req = Request::new(DebitCreditRequest {
-            organization_id: unique_org(),
-            amount_cents: 0,
-            external_reference: String::new(),
-            idempotency_key: String::new(),
-        });
-        let status = billing.debit_credit(req).await.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        for (cost, duration_ms) in [(440_000, 0), (440_000, -1), (0, 1_000), (-1, 1_000)] {
+            let req = Request::new(DebitCreditRequest {
+                organization_id: unique_org(),
+                external_reference: String::new(),
+                idempotency_key: String::new(),
+                runpod_cost_micros_per_hour: cost,
+                duration_ms,
+            });
+            let status = billing.debit_credit(req).await.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "cost={cost} duration_ms={duration_ms}");
+        }
     }
 
     #[tokio::test]
@@ -820,25 +879,29 @@ mod tests {
         let billing = test_billing(pool.clone()).await;
         let org = unique_org();
 
-        credits_db::apply_ledger_entry(&pool, &org, "topup", 100, None, None).await.expect("seed a tiny balance");
+        // $1.00 on hand.
+        credits_db::apply_ledger_entry(&pool, &org, "topup", 1_000_000, None, None).await.expect("seed a tiny balance");
 
-        // $0.60/hr (a 4090's marked-up rate) * 1 hour = 60 cents required; only 100 cents on hand -- sufficient.
+        // 4090: $0.44/hr cost -> $0.60/hr list; 1 hour needs 600_000 micros -- sufficient.
         let req = Request::new(PreflightCreditCheckRequest {
             organization_id: org.clone(),
-            hourly_rate_cents: 60,
+            runpod_cost_micros_per_hour: 440_000,
             min_hours_required: 1.0,
         });
         let resp = billing.preflight_credit_check(req).await.expect("preflight_credit_check").into_inner();
         assert!(resp.sufficient);
-        assert_eq!(resp.balance_cents, 100);
+        assert_eq!(resp.balance_micros, 1_000_000);
+        assert_eq!(resp.customer_rate_micros_per_hour, 600_000);
+        assert_eq!(resp.required_micros, 600_000);
 
-        // Same balance, a GPU that costs more than the whole balance covers for 1 hour -- insufficient.
+        // H100 SXM: $2.99/hr cost -> $4.05/hr list -- more than the whole balance for 1 hour.
         let req = Request::new(PreflightCreditCheckRequest {
-            organization_id: org,
-            hourly_rate_cents: 260, // an A100 SXM 80GB's marked-up rate
-            min_hours_required: 1.0,
+            organization_id: org.clone(),
+            runpod_cost_micros_per_hour: 2_990_000,
+            min_hours_required: 0.0, // <= 0 falls back to the 1.0 default
         });
         let resp = billing.preflight_credit_check(req).await.expect("preflight_credit_check").into_inner();
         assert!(!resp.sufficient);
+        assert_eq!(resp.required_micros, 4_050_000);
     }
 }
