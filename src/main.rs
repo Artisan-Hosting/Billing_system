@@ -36,6 +36,15 @@ enum Command {
 async fn main() {
     set_log_level(LogLevel::Info);
 
+    // reqwest (aws-lc-rs) and tonic's mTLS transport (ring) each link their
+    // own rustls crypto backend, so rustls can no longer infer a process
+    // default on its own -- the gRPC server's ServerTlsConfig panics on the
+    // first accept without this. Must run before anything builds a TLS
+    // config: the Stripe client, the mTLS gRPC server and client all do.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install default rustls CryptoProvider");
+
     let cli = Cli::parse();
     if let Err(err) = run(cli).await {
         log!(LogLevel::Error, "{}", err);
