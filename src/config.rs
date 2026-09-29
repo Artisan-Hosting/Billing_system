@@ -52,7 +52,7 @@ pub struct Auth {
 
 impl Default for Auth {
     fn default() -> Self {
-        Self { grpc_addr: "http://127.0.0.1:50051".to_owned(), token_cache_secs: 60 }
+        Self { grpc_addr: "https://127.0.0.1:50051".to_owned(), token_cache_secs: 60 }
     }
 }
 

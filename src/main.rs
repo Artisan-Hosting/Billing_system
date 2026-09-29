@@ -59,9 +59,7 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(config, secrets).await,
         Command::Migrate => {
-            let pool = db::connect(&secrets.database_url).await?;
-            db::migrate(&pool).await?;
-            log!(LogLevel::Info, "migrations applied");
+            log!(LogLevel::Info, "migrations must be run manually");
             Ok(())
         }
     }
@@ -71,7 +69,7 @@ async fn serve(config: Config, secrets: Secrets) -> Result<()> {
     secrets.require(&[("DATABASE_URL", &secrets.database_url)])?;
 
     let pool = db::connect(&secrets.database_url).await?;
-    db::migrate(&pool).await?;
+    // db::migrate(&pool).await?;
     log!(LogLevel::Info, "database ready");
 
     grpc::serve(config, secrets, pool).await

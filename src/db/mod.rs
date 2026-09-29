@@ -27,7 +27,3 @@ pub async fn connect(database_url: &str) -> Result<MySqlPool> {
         .map_err(Error::Database)
 }
 
-pub async fn migrate(pool: &MySqlPool) -> Result<()> {
-    // sqlx::migrate!("./migrations").run(pool).await.map_err(Error::Migrate)
-    Ok(())
-}
