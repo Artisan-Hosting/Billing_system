@@ -1,0 +1,440 @@
+// --- proto/billing.proto ---
+//
+// A thin, product-agnostic gRPC surface over Stripe. This service does not
+// know what a "domain order," an "invoice," or any other product concept
+// is -- a caller identifies itself with an opaque `consumer` name and
+// tracks its own business objects by an `external_reference` string it
+// chooses; Billing's only job is to talk to Stripe safely on the caller's
+// behalf and remember enough to answer "what happened to that charge"
+// without hitting Stripe on every read.
+//
+// Internal-only: no `access_token`/`elevated_token` field appears anywhere
+// here. The caller is authenticated by mTLS (its own client certificate),
+// not by an end-user token -- domain_management (or whichever service
+// calls this) has already validated the end user and enforced its own
+// spending guardrails before ever reaching Billing. See
+// `src/grpc/service.rs`'s module doc for the reasoning.
+syntax = "proto3";
+package billing;
+
+service BillingService {
+  // Idempotent per (consumer, external_reference): a retried call with the
+  // same pair returns the existing PaymentIntent rather than creating a
+  // second Stripe charge for the same thing.
+  rpc CreatePaymentIntent(CreatePaymentIntentRequest) returns (PaymentIntent);
+  rpc GetPaymentIntent(GetPaymentIntentRequest) returns (PaymentIntent);
+  // Polls internally and yields a new value only when `status` changes --
+  // the same shape domain_management's own `WatchDomain` uses, so a caller
+  // can await a charge resolving without polling `GetPaymentIntent` in a
+  // loop itself.
+  rpc WatchPaymentIntent(WatchPaymentIntentRequest) returns (stream PaymentIntent);
+  rpc CancelPaymentIntent(CancelPaymentIntentRequest) returns (PaymentIntent);
+
+  // Called only by Portal's webhook-forwarding route (or whatever public
+  // ingress relays Stripe's callback), which forwards the raw request body
+  // and `Stripe-Signature` header untouched. This service verifies the
+  // signature itself; a charge is never marked succeeded because a caller
+  // claimed it was.
+  rpc HandleStripeWebhook(StripeWebhookRequest) returns (StripeWebhookResponse);
+}
+
+enum PaymentIntentStatus {
+  PAYMENT_INTENT_STATUS_UNSPECIFIED = 0;
+  PAYMENT_INTENT_STATUS_REQUIRES_PAYMENT_METHOD = 1;
+  PAYMENT_INTENT_STATUS_REQUIRES_CONFIRMATION = 2;
+  PAYMENT_INTENT_STATUS_REQUIRES_ACTION = 3;
+  PAYMENT_INTENT_STATUS_PROCESSING = 4;
+  PAYMENT_INTENT_STATUS_REQUIRES_CAPTURE = 5;
+  PAYMENT_INTENT_STATUS_CANCELED = 6;
+  PAYMENT_INTENT_STATUS_SUCCEEDED = 7;
+}
+
+message PaymentIntent {
+  string id = 1;                      // this service's own row id
+  string stripe_payment_intent_id = 2;
+  string consumer = 3;                // e.g. "domain_management"
+  string external_reference = 4;      // the consumer's own order/quote id
+  int64 amount_cents = 5;
+  string currency = 6;                // ISO 4217, lowercase, e.g. "usd"
+  PaymentIntentStatus status = 7;
+  // Only ever populated in CreatePaymentIntent's own response -- the one
+  // moment a caller needs it, to hand to Stripe.js/Stripe Elements on the
+  // customer's side. Never returned by Get/Watch/Cancel.
+  string client_secret = 8;
+  string last_error = 9;
+  int64 created_at = 10;
+  int64 updated_at = 11;
+  // Stripe's publishable key (not secret -- safe to hand to a browser),
+  // alongside `client_secret` since a caller building a checkout form
+  // needs both together. Same "only in CreatePaymentIntent's response"
+  // rule as `client_secret`.
+  string publishable_key = 12;
+}
+
+message CreatePaymentIntentRequest {
+  string consumer = 1;
+  string external_reference = 2;
+  int64 amount_cents = 3;
+  string currency = 4;                // empty defaults to "usd"
+  // Stamped onto the Stripe PaymentIntent's own metadata, so a human
+  // looking at the Stripe dashboard can trace a charge back to what it was
+  // for. Not interpreted by Billing itself.
+  map<string, string> metadata = 5;
+}
+
+// `id_or_reference` is either this service's own `PaymentIntent.id`, or
+// `"<consumer>:<external_reference>"` -- whichever the caller already has
+// on hand. Split on the *first* `:` only, so an external_reference that
+// itself contains a colon is still handled correctly.
+message GetPaymentIntentRequest {
+  string id_or_reference = 1;
+}
+
+message WatchPaymentIntentRequest {
+  string id_or_reference = 1;
+}
+
+message CancelPaymentIntentRequest {
+  string id_or_reference = 1;
+}
+
+message StripeWebhookRequest {
+  bytes payload = 1;
+  string signature = 2;
+}
+
+message StripeWebhookResponse {
+  bool handled = 1;
+}
+
+// ---------------------------------------------------------------------------
+// BillingAdminService -- plans, subscriptions, invoices, and the GPU/LLM
+// prepaid credit ledger (Price Book v1).
+//
+// Deliberately a *second* service in this file rather than new RPCs bolted
+// onto BillingService above: BillingService stays exactly what its own doc
+// comment says it is (a thin, product-agnostic Stripe gateway, callers
+// authenticated by mTLS alone). BillingAdminService is the opposite shape on
+// purpose -- it *does* know what a plan, a subscription, and a credit
+// balance are, and most of its RPCs are called by Portal on an end user's
+// behalf, so they carry `access_token`/`elevated_token` the way
+// domain_management's `CreateOrderRequest` does. Adding these business
+// concepts here does not contradict BillingService's product-agnosticism:
+// that doc comment is about not knowing what a *caller's own* product is
+// (a domain order, a GPU session) -- Plans/Subscriptions/Invoices/credits are
+// Billing's own business, the same way `payment_intents` already is.
+//
+// Two authorization shapes, split by who calls each RPC:
+//  * End-user-facing (Portal calls on the logged-in user's behalf):
+//    GetSubscription, CreateOrUpgradeSubscription, ScheduleDowngrade,
+//    CancelSubscription, ListInvoices, GetCreditBalance, TopUpCredit. Carry
+//    `access_token`; the two that spend or commit money
+//    (CreateOrUpgradeSubscription, TopUpCredit) additionally require
+//    `elevated_token`, the same bar domain_management's `create_order` sits
+//    behind -- see that RPC's own AUTHZ comment for the reasoning this
+//    mirrors.
+//  * Internal-only (mTLS-authenticated trusted callers -- a monthly
+//    billing-cycle job, RunpodManager's metering loop, and every other
+//    service's own purchase-gating): RecordOverageUsage, DebitCredit,
+//    PreflightCreditCheck, GetOrganizationBillingStatus. No end-user token
+//    at all, matching BillingService's own internal RPCs above.
+//    GetOrganizationBillingStatus belongs here rather than the
+//    end-user-facing group even though Portal may also want to show a
+//    "why is my org suspended" banner someday: its primary caller is
+//    another *service* deciding whether to allow a brand new
+//    purchase-shaped action (a VM start, a domain order) before that
+//    service has any end-user token of its own to forward -- see
+//    `domain_management::billing::BillingClient::organization_permits_new_purchases`,
+//    the first such caller.
+service BillingAdminService {
+  // AUTHZ: access_token only (a read). Returns NOT_FOUND if the org has no
+  // subscription in this storefront yet -- distinct from an empty/default
+  // Subscription, so a caller can tell "never subscribed" from "subscribed
+  // to a free plan."
+  rpc GetSubscription(GetSubscriptionRequest) returns (Subscription);
+
+  // AUTHZ: Action::Purchase on ResourceType::Subscription **and** an
+  // elevated token, exactly domain_management::create_order's bar -- this is
+  // the one RPC in this service that can charge an organization's card
+  // immediately (a prorated upgrade charge, or the full price for a brand
+  // new subscription). Creates the subscription if none exists yet for this
+  // (organization_id, storefront); upgrades it in place (effective
+  // immediately, prorated) if one does. Downgrading via this RPC is
+  // rejected -- use ScheduleDowngrade, which takes effect at the end of the
+  // current period instead of charging a proration this moment could get
+  // wrong.
+  //
+  // This platform has no saved-card/Stripe-Customer concept (see
+  // BillingService's own doc comment -- PaymentIntents only), so "charge
+  // immediately" means a checkout step, the same as
+  // domain_management's `CreateOrder` -> `OrderCheckout`: the response
+  // carries a `PaymentIntent` alongside the `Subscription`, with a
+  // `client_secret`/`publishable_key` for the customer's Stripe Elements
+  // form. The subscription row exists (`status` reflects it) whether or not
+  // that charge is ever completed -- see `SubscriptionCheckout`'s own
+  // comment for why.
+  rpc CreateOrUpgradeSubscription(CreateOrUpgradeSubscriptionRequest) returns (SubscriptionCheckout);
+
+  // AUTHZ: access_token only -- queues a plan change for the end of the
+  // current period without charging anything now, so it does not need the
+  // elevated bar CreateOrUpgradeSubscription does.
+  rpc ScheduleDowngrade(ScheduleDowngradeRequest) returns (Subscription);
+
+  // AUTHZ: access_token only, same reasoning as ScheduleDowngrade --
+  // cancellation takes effect at period end (`cancel_at_period_end`); it
+  // does not refund or charge anything immediately.
+  rpc CancelSubscription(CancelSubscriptionRequest) returns (Subscription);
+
+  // Internal only, no end-user token -- called once per (organization,
+  // subscription) per billing cycle by the monthly billing-cycle job, which
+  // has already reduced an aggregator run to per-unit quantities (see
+  // `billing::overage::PoolUsage` on the Rust side). Finalizes an invoice
+  // for the period: the plan's base price plus whatever
+  // `overage::calculate_pool_overage` prices `usage` at above the plan's
+  // allowance.
+  rpc RecordOverageUsage(RecordOverageUsageRequest) returns (Invoice);
+
+  // AUTHZ: access_token only (a read), organization-scoped the same way
+  // domain_management's ListOrdersRequest is.
+  rpc ListInvoices(ListInvoicesRequest) returns (ListInvoicesResponse);
+
+  // Internal only, no end-user token -- the hot-path status check every
+  // other service's purchase-gating calls before letting an org start a new
+  // VM/GPU session/domain order. Returns the most severe status across
+  // every one of the org's subscriptions in `status`, plus the full
+  // per-storefront breakdown in `subscriptions` for a caller that cares
+  // which one.
+  rpc GetOrganizationBillingStatus(GetOrganizationBillingStatusRequest) returns (OrgBillingStatus);
+
+  // AUTHZ: access_token only (a read).
+  rpc GetCreditBalance(GetCreditBalanceRequest) returns (CreditBalance);
+
+  // AUTHZ: Action::Purchase on ResourceType::Subscription **and** an
+  // elevated token, same bar as CreateOrUpgradeSubscription -- this spends
+  // real money. Wraps BillingService's own CreatePaymentIntent (reuses
+  // `PaymentIntent` below, including its `client_secret`/`publishable_key`
+  // for the customer's Stripe Elements form); the credit ledger entry is
+  // written once the payment is confirmed by HandleStripeWebhook, not here
+  // -- `TopUpCredit` only ever returns a PaymentIntent still awaiting
+  // confirmation, the same "money isn't real until Stripe says so" rule
+  // BillingService's own webhook-only status updates already enforce.
+  rpc TopUpCredit(TopUpCreditRequest) returns (PaymentIntent);
+
+  // Internal only, no end-user token -- called by RunpodManager's metering
+  // loop, per active GPU session, roughly every second. `idempotency_key`
+  // (typically "<session_id>:<tick_sequence>") makes a retried debit safe,
+  // the same reasoning BillingService's own Stripe idempotency key exists
+  // for. The returned balance MAY be negative -- this RPC never refuses a
+  // debit outright (the final partial-second tick at shutdown cannot be
+  // un-billed), it only reports where the balance landed; RunpodManager
+  // decides when a negative/near-zero balance means "tear the pod down,"
+  // this service has no notion of pods.
+  rpc DebitCredit(DebitCreditRequest) returns (CreditBalance);
+
+  // Internal only, no end-user token -- called by RunpodManager before
+  // provisioning a session, with the marked-up hourly rate it already
+  // computed (`runpod::markup::customer_rate_per_hour` on the Rust side).
+  // Refuses nothing itself; `sufficient` is the caller's signal to refuse
+  // starting the session.
+  rpc PreflightCreditCheck(PreflightCreditCheckRequest) returns (PreflightCreditCheckResponse);
+}
+
+// A domain-specific superset of the platform's canonical Status --
+// `billing::domain::BillingStatus` on the Rust side owns the full
+// wire-format contract (as_str_name/from_str_name); this enum is its gRPC
+// mirror. See that type's own doc comment for why billing/suspension state
+// is modeled here and not on the shared Organization type.
+enum BillingStatus {
+  BILLING_STATUS_UNSPECIFIED = 0;
+  BILLING_STATUS_ACTIVE = 1;
+  BILLING_STATUS_PAST_DUE = 2;
+  BILLING_STATUS_GRACE_PERIOD = 3;
+  BILLING_STATUS_SUSPENDED = 4;
+  BILLING_STATUS_DELETED = 5;
+}
+
+message Subscription {
+  string id = 1;
+  string organization_id = 2;
+  // "developer" | "business" | "email" -- a free string, not an enum, the
+  // same reasoning `plans.storefront` is a VARCHAR and not a SQL ENUM (see
+  // migrations/0002_plans.sql): a new storefront should never need every
+  // consumer of this proto redeployed to recognize it.
+  string storefront = 3;
+  string plan_code = 4;
+  BillingStatus status = 5;
+  int64 current_period_start = 6;
+  int64 current_period_end = 7;
+  // A downgrade queued for `current_period_end`; empty when none is queued.
+  // Upgrades apply immediately via CreateOrUpgradeSubscription and never
+  // populate this field.
+  string pending_plan_code = 8;
+  bool cancel_at_period_end = 9;
+  int64 created_at = 10;
+  int64 updated_at = 11;
+}
+
+// The subscription row always exists after `CreateOrUpgradeSubscription`
+// returns, whether or not the accompanying charge is ever completed --
+// `subscription.status` starts at `BILLING_STATUS_PAST_DUE` (not `ACTIVE`)
+// for a brand new subscription, or is left unchanged by an upgrade attempt,
+// and only moves to `ACTIVE` once `HandleStripeWebhook` observes the
+// corresponding `PaymentIntent` succeed. This means a caller can retry a
+// failed/abandoned checkout by calling `GetSubscription` and, if still not
+// `ACTIVE`, re-attempting payment against the *same* invoice rather than by
+// calling `CreateOrUpgradeSubscription` again (which would otherwise create
+// a second invoice for the same period).
+message SubscriptionCheckout {
+  Subscription subscription = 1;
+  Invoice invoice = 2;
+  string stripe_client_secret = 3;
+  string stripe_publishable_key = 4;
+}
+
+message GetSubscriptionRequest {
+  string access_token = 1;
+  string organization_id = 2;
+  string storefront = 3;
+}
+
+message CreateOrUpgradeSubscriptionRequest {
+  string access_token = 1;
+  string organization_id = 2;
+  string storefront = 3;
+  string plan_code = 4;
+  // Spending money needs a fresh password check, the same bar
+  // domain_management's CreateOrderRequest sits behind.
+  string elevated_token = 5;
+}
+
+message ScheduleDowngradeRequest {
+  string access_token = 1;
+  string organization_id = 2;
+  string storefront = 3;
+  string plan_code = 4;   // takes effect at current_period_end
+}
+
+message CancelSubscriptionRequest {
+  string access_token = 1;
+  string organization_id = 2;
+  string storefront = 3;
+}
+
+// One unit's worth of usage for a billing period, already reduced to the
+// appropriate average/total per `billing::overage::PoolUsage`'s own doc
+// comment (RAM/vCPU as period averages, egress/email as period totals).
+// Opaque unit_code, same convention `plan_allowances`/`plan_overage_rates`
+// already use -- this message never hardcodes which units exist.
+message UnitUsage {
+  string unit_code = 1;
+  double quantity = 2;
+}
+
+message RecordOverageUsageRequest {
+  string organization_id = 1;
+  string storefront = 2;
+  int64 period_start = 3;
+  int64 period_end = 4;
+  repeated UnitUsage usage = 5;
+}
+
+message InvoiceLineItem {
+  string unit_code = 1;       // empty for the plan's own base-price line
+  string description = 2;
+  double quantity = 3;
+  double unit_price_cents = 4;
+  int64 amount_cents = 5;
+}
+
+message Invoice {
+  string id = 1;
+  string organization_id = 2;
+  string subscription_id = 3;   // empty for a one-off charge with no subscription behind it
+  int64 period_start = 4;
+  int64 period_end = 5;
+  // draft | open | paid | void | uncollectible -- a free string, matching
+  // `invoices.status`'s own convention, not BillingStatus (an invoice's
+  // lifecycle and a subscription's billing status are related but distinct;
+  // conflating them into one enum would force an invoice to mean something
+  // about the subscription it may have outlived).
+  string status = 6;
+  int64 total_cents = 7;
+  string currency = 8;
+  string stripe_payment_intent_id = 9;   // empty until a PaymentIntent exists for it
+  repeated InvoiceLineItem line_items = 10;
+  int64 created_at = 11;
+  int64 updated_at = 12;
+}
+
+message ListInvoicesRequest {
+  string access_token = 1;
+  string organization_id = 2;
+  string storefront = 3;   // empty means every storefront
+  int32 limit = 4;
+  int32 offset = 5;
+}
+
+message ListInvoicesResponse {
+  repeated Invoice invoices = 1;
+}
+
+message GetOrganizationBillingStatusRequest {
+  string organization_id = 1;
+}
+
+message SubscriptionStatusSummary {
+  string storefront = 1;
+  string plan_code = 2;
+  BillingStatus status = 3;
+}
+
+message OrgBillingStatus {
+  string organization_id = 1;
+  // The most severe status across every one of this org's subscriptions
+  // (Deleted > Suspended > GracePeriod > PastDue > Active), or
+  // BILLING_STATUS_ACTIVE if the org has no subscriptions at all -- "never
+  // subscribed to anything" is not itself a reason to refuse a purchase
+  // that would create the first one.
+  BillingStatus status = 2;
+  repeated SubscriptionStatusSummary subscriptions = 3;
+}
+
+message GetCreditBalanceRequest {
+  string access_token = 1;
+  string organization_id = 2;
+}
+
+message CreditBalance {
+  string organization_id = 1;
+  int64 balance_cents = 2;
+  // 0 means no cap configured, matching `credit_accounts.monthly_spend_cap_cents`
+  // being NULLable -- a real cap of exactly $0 is not a state this system
+  // has any use for (it would mean "can never spend anything").
+  int64 monthly_spend_cap_cents = 3;
+}
+
+message TopUpCreditRequest {
+  string access_token = 1;
+  string organization_id = 2;
+  int64 amount_cents = 3;   // minimum enforced server-side per the Price Book (so Stripe's own fee can't eat a top-up)
+  string currency = 4;      // empty defaults to "usd"
+  string elevated_token = 5;
+}
+
+message DebitCreditRequest {
+  string organization_id = 1;
+  int64 amount_cents = 2;         // positive; this RPC always debits, never credits
+  string external_reference = 3;  // the Runpod session id this debit metered
+  string idempotency_key = 4;
+}
+
+message PreflightCreditCheckRequest {
+  string organization_id = 1;
+  int64 hourly_rate_cents = 2;   // the marked-up customer rate, already computed by the caller
+  double min_hours_required = 3; // Price Book default: 1.0
+}
+
+message PreflightCreditCheckResponse {
+  bool sufficient = 1;
+  int64 balance_cents = 2;   // for the caller's own logging/UI, not itself the pass/fail signal
+}

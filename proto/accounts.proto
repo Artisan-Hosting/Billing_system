@@ -1,0 +1,183 @@
+// --- proto/accounts.proto ---
+syntax = "proto3";
+package accounts;
+
+service AccountInternal {
+  rpc Login(LoginRequest) returns (TokenPair);
+  rpc RefreshTokens(RefreshRequest) returns (TokenPair);
+  rpc ValidateToken(TokenRequest) returns (ValidateResponse);
+  rpc GetUser(GetUserRequest) returns (UserProfile);
+  rpc HasPermission(PermissionRequest) returns (PermissionResponse);
+  rpc GetRunnerOrgId(RunnerOrgIdRequest) returns (RunnerOrgIdResponse);
+
+  // Phase F: org/admin management (MVP).
+  //
+  // ElevateSession re-checks the caller's password and, on success, mints a
+  // short-TTL elevated token. CreateOrganization and UpdateUserOrg require
+  // that elevated token (not just a normal access token) in addition to the
+  // caller's role, since both mutate sensitive account/org state.
+  // ListOrganizations/ListUsersInOrg are read-only and only need a normal
+  // access token -- the elevation gate is for writes, not for viewing.
+  rpc ElevateSession(ElevateRequest) returns (ElevatedTokenResponse);
+  rpc CreateOrganization(CreateOrganizationRequest) returns (OrganizationInfo);
+  rpc ListOrganizations(ListOrganizationsRequest) returns (ListOrganizationsResponse);
+  rpc ListUsersInOrg(ListUsersInOrgRequest) returns (ListUsersInOrgResponse);
+  rpc UpdateUserOrg(UpdateUserOrgRequest) returns (UpdateUserOrgResponse);
+
+  // Phase G: email invites to join an org.
+  //
+  // CreateInvite/ListInvites/RevokeInvite follow the exact same
+  // elevated-token-for-writes / normal-token-for-reads and
+  // Super-vs-org-scoped-Admin pattern as the Phase F RPCs above.
+  // AcceptInvite is the odd one out: it's public (no bearer token at all --
+  // the caller doesn't have an account yet) and is the first and only code
+  // path in this service that ever creates a `users` row.
+  rpc CreateInvite(CreateInviteRequest) returns (InviteInfo);
+  rpc ListInvites(ListInvitesRequest) returns (ListInvitesResponse);
+  rpc RevokeInvite(RevokeInviteRequest) returns (RevokeInviteResponse);
+  rpc AcceptInvite(AcceptInviteRequest) returns (TokenPair);
+
+  // Phase H: org <-> project (repo/runner) association. `runners` already
+  // existed before this phase (name, organization_id) -- these RPCs are the
+  // first code in the platform to ever write to it; before this, that
+  // column was populated out-of-band. Same elevated-token-for-writes /
+  // normal-token-for-reads and Super-vs-org-scoped-Admin pattern as the
+  // Phase F/G RPCs above.
+  rpc AssignRunnerOrg(AssignRunnerOrgRequest) returns (AssignRunnerOrgResponse);
+  rpc RemoveRunnerFromOrg(RemoveRunnerFromOrgRequest) returns (RemoveRunnerFromOrgResponse);
+  rpc ListRunnersInOrg(ListRunnersInOrgRequest) returns (ListRunnersInOrgResponse);
+
+  // RBAC Phase 1: the generic resource_type x action policy engine.
+  //
+  // EvaluateAccess is a read-only decision, called by any service on every
+  // request it authorizes -- normal access token, no elevation. The
+  // grant/policy mutations below follow the exact same elevated-token /
+  // Super-vs-org-scoped-Admin pattern as every other write RPC in this file.
+  // IssueServiceCredential mints a bearer secret for a non-human,
+  // per-org-deployed caller (e.g. one project_Kaelum instance) that can't
+  // hold a normal user JWT; ValidateServiceCredential is that caller's
+  // equivalent of ValidateToken.
+  rpc EvaluateAccess(EvaluateAccessRequest) returns (PermissionResponse);
+  rpc GrantResourcePermission(GrantResourceRequest) returns (GrantResourceResponse);
+  rpc RevokeResourcePermission(RevokeResourceRequest) returns (RevokeResourceResponse);
+  rpc ListResourceGrants(ListResourceGrantsRequest) returns (ListResourceGrantsResponse);
+  rpc SetOrgPolicy(SetOrgPolicyRequest) returns (SetOrgPolicyResponse);
+  rpc ListOrgPolicies(ListOrgPoliciesRequest) returns (ListOrgPoliciesResponse);
+  rpc IssueServiceCredential(IssueServiceCredentialRequest) returns (IssueServiceCredentialResponse);
+  rpc ValidateServiceCredential(ValidateServiceCredentialRequest) returns (ValidateServiceCredentialResponse);
+
+  // RBAC Phase 5: on-demand, mTLS-minted service session tokens (GLOBAL org
+  // platform-infra only -- Manager, watchdog, gitmon). RequestServiceSession
+  // carries no credential field at all: the caller's mTLS client certificate
+  // (already required by the transport layer) *is* the credential, and the
+  // service name it authenticates as comes from that certificate's SAN/CN,
+  // not from anything the caller types into the request. Short TTL (fixed,
+  // v1 ignores requested_ttl_secs), and unlike every other token type here,
+  // validating one also re-checks live revocation, not signature+expiry
+  // alone -- an admin revoking a service kills its already-minted tokens
+  // immediately. ResolveServiceIdentity lets an admin learn/create a
+  // service's stable credential_id (to grant it permissions) without that
+  // service ever having called in yet.
+  rpc RequestServiceSession(RequestServiceSessionRequest) returns (RequestServiceSessionResponse);
+  rpc ResolveServiceIdentity(ResolveServiceIdentityRequest) returns (ResolveServiceIdentityResponse);
+
+  // RBAC Phase 3/4: the service-credential equivalent of EvaluateAccess. The
+  // caller presents a raw service credential (not a JWT); ais_auth validates
+  // it and decides against resource_grants keyed by the credential's id.
+  // Fail-closed: any error, unknown/revoked credential, or missing grant is
+  // `yes = false`. Never elevated -- it is a read-only decision.
+  rpc EvaluateServiceAccess(EvaluateServiceAccessRequest) returns (EvaluateServiceAccessResponse);
+}
+
+message LoginRequest { string email = 1; string password = 2; }
+message RefreshRequest { string refresh_token = 1; }
+message TokenRequest { string access_token = 1; }
+message ValidateResponse { bool valid = 1; string user_id = 2; map<string,string> claims = 3; }
+message TokenPair { string access_token = 1; string refresh_token = 2; int64 login_expires_in = 3; int64 refresh_expires_in = 4; }
+message GetUserRequest { string user_id = 1; }
+message UserProfile { string user_id = 1; string email = 2; string uuid = 3; }
+message PermissionRequest { map<string,string> claims = 1; string project_name = 2; string role = 3; }
+message PermissionResponse { bool yes = 1; }
+message RunnerOrgIdRequest { string project_name = 1; }
+message RunnerOrgIdResponse { string organization_id = 1; }
+message Empty {}
+
+// --- Phase F: org/admin management ---
+
+message ElevateRequest { string access_token = 1; string password = 2; }
+message ElevatedTokenResponse { string elevated_token = 1; int64 expires_in = 2; }
+
+message CreateOrganizationRequest { string elevated_token = 1; string name = 2; }
+message OrganizationInfo { string id = 1; string name = 2; int64 created_at = 3; }
+
+message ListOrganizationsRequest { string access_token = 1; }
+message ListOrganizationsResponse { repeated OrganizationInfo organizations = 1; }
+
+message ListUsersInOrgRequest { string access_token = 1; string organization_id = 2; }
+message UserSummary { string id = 1; string email = 2; string display_name = 3; string role = 4; string organization_id = 5; }
+message ListUsersInOrgResponse { repeated UserSummary users = 1; }
+
+message UpdateUserOrgRequest { string elevated_token = 1; string user_id = 2; string organization_id = 3; string role = 4; }
+message UpdateUserOrgResponse { bool success = 1; }
+
+// --- Phase G: email invites ---
+
+message CreateInviteRequest { string elevated_token = 1; string email = 2; string organization_id = 3; string role = 4; }
+message InviteInfo { string id = 1; string email = 2; string organization_id = 3; string role = 4; int64 created_at = 5; int64 expires_at = 6; }
+
+message ListInvitesRequest { string access_token = 1; string organization_id = 2; }
+message ListInvitesResponse { repeated InviteInfo invites = 1; }
+
+message RevokeInviteRequest { string elevated_token = 1; string invite_id = 2; }
+message RevokeInviteResponse { bool success = 1; }
+
+message AcceptInviteRequest { string token = 1; string display_name = 2; string password = 3; }
+
+// --- Phase H: org <-> project (repo/runner) association ---
+
+message AssignRunnerOrgRequest { string elevated_token = 1; string runner_name = 2; string organization_id = 3; }
+message AssignRunnerOrgResponse { bool success = 1; }
+
+message RemoveRunnerFromOrgRequest { string elevated_token = 1; string runner_name = 2; }
+message RemoveRunnerFromOrgResponse { bool success = 1; }
+
+message ListRunnersInOrgRequest { string access_token = 1; string organization_id = 2; }
+message ListRunnersInOrgResponse { repeated string runner_names = 1; }
+
+// --- RBAC Phase 1: resource grants, org policies, service credentials ---
+
+message EvaluateAccessRequest { map<string,string> claims = 1; string resource_type = 2; string resource_id = 3; string action = 4; }
+
+message GrantResourceRequest { string elevated_token = 1; string target_user_id = 2; string resource_type = 3; string resource_id = 4; string action = 5; }
+message GrantResourceResponse { bool success = 1; }
+message RevokeResourceRequest { string elevated_token = 1; string target_user_id = 2; string resource_type = 3; string resource_id = 4; string action = 5; }
+message RevokeResourceResponse { bool success = 1; }
+
+message ListResourceGrantsRequest { string access_token = 1; string resource_type = 2; string resource_id = 3; }
+message ResourceGrant { string user_id = 1; string resource_type = 2; string resource_id = 3; string action = 4; string granted_by = 5; int64 created_at = 6; }
+message ListResourceGrantsResponse { repeated ResourceGrant grants = 1; }
+
+message SetOrgPolicyRequest { string elevated_token = 1; string organization_id = 2; string resource_type = 3; string action = 4; string role = 5; bool allow = 6; }
+message SetOrgPolicyResponse { bool success = 1; }
+message ListOrgPoliciesRequest { string access_token = 1; string organization_id = 2; }
+message OrgPolicy { string organization_id = 1; string resource_type = 2; string action = 3; string role = 4; bool allow = 5; }
+message ListOrgPoliciesResponse { repeated OrgPolicy policies = 1; }
+
+message IssueServiceCredentialRequest { string elevated_token = 1; string organization_id = 2; string service_name = 3; }
+// credential_id is the stable grant subject: pass it as GrantResourcePermission's
+// target_user_id to scope what this credential may touch. It survives rotation.
+message IssueServiceCredentialResponse { string raw_credential = 1; string credential_id = 2; }
+message ValidateServiceCredentialRequest { string raw_credential = 1; }
+message ValidateServiceCredentialResponse { bool valid = 1; string organization_id = 2; string service_name = 3; string credential_id = 4; }
+
+message EvaluateServiceAccessRequest { string raw_credential = 1; string resource_type = 2; string resource_id = 3; string action = 4; }
+// service_name / credential_id are only populated when the credential itself was
+// valid (even if the grant check then said no), so the caller can audit who asked.
+message EvaluateServiceAccessResponse { bool yes = 1; string service_name = 2; string credential_id = 3; }
+
+// RBAC Phase 5: mTLS-minted service session tokens.
+message RequestServiceSessionRequest { int64 requested_ttl_secs = 1; } // v1: ignored, server always issues a fixed TTL
+message RequestServiceSessionResponse { string session_token = 1; int64 expires_in = 2; string credential_id = 3; }
+
+message ResolveServiceIdentityRequest { string elevated_token = 1; string organization_id = 2; string service_name = 3; }
+message ResolveServiceIdentityResponse { string credential_id = 1; }

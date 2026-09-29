@@ -2,10 +2,52 @@
 name = "Billing"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
+
+# The package (and its `[[bin]]`) stay named `Billing`, matching the
+# directory and the existing binary name; the library target gets a
+# conventional snake_case crate name so `use billing::...` reads normally
+# and rustc's nonstandard_style lint stays quiet.
+[lib]
+name = "billing"
+path = "src/lib.rs"
 
 [dependencies]
-artisan_middleware = "7.0.0"
-serde = "1.0.219"
+# >=7.1.0 for artisan_middleware::mtls (MtlsConfig/load_mtls_material) --
+# domain_management's own server-side mTLS setup depends on this module,
+# absent from the 7.0.0 this crate previously pinned.
+artisan_middleware = "7.1.0"
+serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-tokio = "1.44.2"
+tokio = { version = "1.44.2", features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
 warp = "0.3.7"
+
+# gRPC, matching domain_management's pin (only the wire format has to agree
+# between crates, not the tonic version).
+tonic = { version = "0.14", features = ["transport", "tls-ring"] }
+tonic-prost = "0.14"
+tonic-reflection = "0.14"
+prost = "0.14"
+tokio-stream = "0.1"
+# For WatchPaymentIntent's poll-and-yield-on-change stream -- writing that
+# loop as a hand-rolled `Stream` impl is enough boilerplate that this small,
+# single-purpose crate earns its place, the same call domain_management's
+# own plan for its analogous WatchDomain RPC already made.
+async-stream = "0.3"
+
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "mysql", "chrono", "migrate"] }
+
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls", "charset", "http2"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+thiserror = "2"
+json_comments = "0.2"
+clap = { version = "4.5", features = ["derive", "env"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "io-util"] }
