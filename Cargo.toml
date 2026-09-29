@@ -20,7 +20,6 @@ artisan_middleware = "7.1.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 tokio = { version = "1.44.2", features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
-warp = "0.3.7"
 
 # gRPC, matching domain_management's pin (only the wire format has to agree
 # between crates, not the tonic version).

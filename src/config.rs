@@ -23,14 +23,13 @@ pub const DEFAULT_ENV_PATH: &str = "/opt/artisan/etc/billing.env";
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub grpc: Grpc,
-    pub http: Http,
     pub auth: Auth,
     pub purchasing: Purchasing,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { grpc: Grpc::default(), http: Http::default(), auth: Auth::default(), purchasing: Purchasing::default() }
+        Self { grpc: Grpc::default(), auth: Auth::default(), purchasing: Purchasing::default() }
     }
 }
 
@@ -92,20 +91,6 @@ impl Default for Grpc {
         // have their own) -- chosen and recorded here so it only needs
         // choosing once.
         Self { bind: "0.0.0.0:50061".to_owned(), reflection: true }
-    }
-}
-
-/// The pre-existing usage-cost HTTP surface (`POST /calculate`),
-/// unchanged in behavior -- only now configurable rather than hardcoded.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Http {
-    pub bind: String,
-}
-
-impl Default for Http {
-    fn default() -> Self {
-        Self { bind: "0.0.0.0:3031".to_owned() }
     }
 }
 

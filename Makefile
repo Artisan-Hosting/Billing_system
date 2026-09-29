@@ -9,7 +9,7 @@ build:
 release:
 	cargo build --release
 
-## Run the gRPC service + usage-cost HTTP server against the example config.
+## Run the gRPC service against the example config.
 run: build
 	cargo run -- --config $(CONFIG) --env-file $(ENV_FILE)
 
