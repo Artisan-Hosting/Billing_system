@@ -13,7 +13,7 @@ release:
 run: build
 	cargo run -- --config $(CONFIG) --env-file $(ENV_FILE)
 
-## Apply pending database migrations and exit.
+## Prints a reminder that migrations are applied manually.
 migrate: build
 	cargo run -- --config $(CONFIG) --env-file $(ENV_FILE) migrate
 

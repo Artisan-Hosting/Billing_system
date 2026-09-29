@@ -28,7 +28,7 @@ struct Cli {
 enum Command {
     /// Run the gRPC service (the default).
     Serve,
-    /// Apply pending database migrations and exit.
+    /// Remind that migrations are applied manually, then exit.
     Migrate,
 }
 
