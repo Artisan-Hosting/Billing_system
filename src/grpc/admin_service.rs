@@ -615,7 +615,7 @@ impl BillingAdminService for Billing {
 
         let pi = self
             .create_payment_intent(Request::new(CreatePaymentIntentRequest {
-                consumer: "billing_credit_topup".to_owned(),
+                consumer: crate::credit::TOPUP_CONSUMER.to_owned(),
                 external_reference,
                 amount_cents: req.amount_cents,
                 currency,

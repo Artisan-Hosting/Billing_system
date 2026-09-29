@@ -15,6 +15,11 @@
 //! (Price Book v1: cost x 1.35, rounded up to $0.05), and
 //! [`debit_micros`] prices a slice of session time at that rate.
 
+/// The `consumer` `TopUpCredit` stamps on the PaymentIntents that fund a
+/// credit top-up; the webhook uses it to tell those apart from every other
+/// charge this service makes.
+pub const TOPUP_CONSUMER: &str = "billing_credit_topup";
+
 /// Micro-dollars in one cent.
 pub const MICROS_PER_CENT: i64 = 10_000;
 

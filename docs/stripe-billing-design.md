@@ -144,7 +144,15 @@ has to respect or the spreadsheet does not yet cover:
 
 ## Implementation order
 
-0. **Done:** credit ledger in micro-dollars, Billing-owned GPU markup
+0. **Done (2):** webhook inbox (`stripe_events`, migration 0009) and credit
+   crediting: `payment_intent.succeeded` for a `TopUpCredit` PaymentIntent
+   credits `cents_to_micros(amount)` exactly once (ledger key `topup:<pi>`);
+   `charge.refunded` reverses the cumulative refunded amount (diffed against
+   earlier reversals, so redelivery/reordering is safe); `charge.dispute.created`
+   claws back and `charge.dispute.closed` (won) reinstates. Refunds/disputes
+   find the org from the ledger's own top-up entry, not event metadata. A
+   refund can leave the balance negative if the credit was already spent.
+0. **Done (1):** credit ledger in micro-dollars, Billing-owned GPU markup
    (`DebitCredit` / `PreflightCreditCheck` now take the raw Runpod cost,
    migration `0008_credit_micros.sql`).
 1. Create the Stripe Customer at organization creation (hook or RPC called by

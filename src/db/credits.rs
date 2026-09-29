@@ -5,7 +5,7 @@
 //! with the append-only `credit_ledger_entries` inside the same transaction
 //! as every write -- see [`apply_ledger_entry`]'s own doc comment.
 
-use sqlx::{MySqlPool, Row};
+use sqlx::{MySql, MySqlPool, Row, Transaction};
 
 use crate::error::Result;
 
@@ -64,10 +64,25 @@ pub async fn apply_ledger_entry(
     idempotency_key: Option<&str>,
 ) -> Result<(i64, bool)> {
     let mut tx = pool.begin().await?;
+    let result =
+        apply_ledger_entry_in(&mut tx, organization_id, entry_type, amount_micros, external_reference, idempotency_key).await?;
+    tx.commit().await?;
+    Ok(result)
+}
 
+/// [`apply_ledger_entry`]'s body, for a caller that already holds the
+/// transaction (so it can do other reads/writes atomically with the entry).
+pub async fn apply_ledger_entry_in(
+    tx: &mut Transaction<'_, MySql>,
+    organization_id: &str,
+    entry_type: &str,
+    amount_micros: i64,
+    external_reference: Option<&str>,
+    idempotency_key: Option<&str>,
+) -> Result<(i64, bool)> {
     sqlx::query("INSERT INTO credit_accounts (organization_id) VALUES (?) ON DUPLICATE KEY UPDATE organization_id = organization_id")
         .bind(organization_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
     if let Some(key) = idempotency_key {
@@ -76,10 +91,9 @@ pub async fn apply_ledger_entry(
         )
         .bind(organization_id)
         .bind(key)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
         if let Some(balance_after_micros) = existing {
-            tx.commit().await?;
             return Ok((balance_after_micros, false));
         }
     }
@@ -87,12 +101,12 @@ pub async fn apply_ledger_entry(
     sqlx::query("UPDATE credit_accounts SET balance_micros = balance_micros + ? WHERE organization_id = ?")
         .bind(amount_micros)
         .bind(organization_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
     let new_balance: i64 = sqlx::query_scalar("SELECT balance_micros FROM credit_accounts WHERE organization_id = ?")
         .bind(organization_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
 
     sqlx::query(
@@ -106,11 +120,88 @@ pub async fn apply_ledger_entry(
     .bind(external_reference)
     .bind(idempotency_key)
     .bind(new_balance)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
-    tx.commit().await?;
     Ok((new_balance, true))
+}
+
+/// The top-up entry a Stripe PaymentIntent funded: `(organization_id,
+/// amount_micros)`. `None` means that PaymentIntent never credited anyone
+/// (it wasn't a credit top-up, or hasn't succeeded yet) -- refund and dispute
+/// events use this to decide whether they concern the credit ledger at all,
+/// and whose it is, without trusting metadata on the event.
+pub async fn find_topup_for_payment_intent(pool: &MySqlPool, stripe_payment_intent_id: &str) -> Result<Option<(String, i64)>> {
+    let row = sqlx::query(
+        "SELECT organization_id, amount_micros FROM credit_ledger_entries \
+         WHERE entry_type = 'topup' AND external_reference = ? LIMIT 1",
+    )
+    .bind(stripe_payment_intent_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| (r.get("organization_id"), r.get("amount_micros"))))
+}
+
+/// Whether this org already has a ledger entry with this idempotency key.
+pub async fn has_entry(pool: &MySqlPool, organization_id: &str, idempotency_key: &str) -> Result<bool> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM credit_ledger_entries WHERE organization_id = ? AND idempotency_key = ?")
+            .bind(organization_id)
+            .bind(idempotency_key)
+            .fetch_one(pool)
+            .await?;
+    Ok(count > 0)
+}
+
+/// Brings the ledger's total *reversal* for one PaymentIntent up to
+/// `cumulative_micros`, writing a single negative `adjustment` for the
+/// difference. Stripe reports a charge's refunds as a running total
+/// (`amount_refunded`), and may deliver `charge.refunded` more than once or
+/// out of order, so this diffs against what earlier `<key_prefix>:` entries
+/// already reversed rather than trusting each event as a fresh delta.
+/// Returns the reversed amount, or `None` when there was nothing new (a
+/// duplicate, or an older total arriving late). The balance may go negative:
+/// credit already spent cannot be un-spent.
+pub async fn reverse_to_cumulative(
+    pool: &MySqlPool,
+    organization_id: &str,
+    stripe_payment_intent_id: &str,
+    key_prefix: &str,
+    cumulative_micros: i64,
+) -> Result<Option<i64>> {
+    let mut tx = pool.begin().await?;
+
+    // Serializes concurrent events for one org so the diff below is exact.
+    sqlx::query("INSERT INTO credit_accounts (organization_id) VALUES (?) ON DUPLICATE KEY UPDATE organization_id = organization_id")
+        .bind(organization_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT balance_micros FROM credit_accounts WHERE organization_id = ? FOR UPDATE")
+        .bind(organization_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    let already: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(-amount_micros), 0) AS SIGNED) FROM credit_ledger_entries \
+         WHERE organization_id = ? AND external_reference = ? AND idempotency_key LIKE ?",
+    )
+    .bind(organization_id)
+    .bind(stripe_payment_intent_id)
+    .bind(format!("{key_prefix}:%"))
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let delta = cumulative_micros - already;
+    if delta <= 0 {
+        tx.commit().await?;
+        return Ok(None);
+    }
+
+    let key = format!("{key_prefix}:{stripe_payment_intent_id}:{cumulative_micros}");
+    let (_, applied) =
+        apply_ledger_entry_in(&mut tx, organization_id, "adjustment", -delta, Some(stripe_payment_intent_id), Some(&key)).await?;
+    tx.commit().await?;
+    Ok(if applied { Some(delta) } else { None })
 }
 
 #[cfg(test)]

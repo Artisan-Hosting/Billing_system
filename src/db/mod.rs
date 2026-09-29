@@ -7,6 +7,7 @@ pub mod credits;
 pub mod invoices;
 pub mod payment_intents;
 pub mod plans;
+pub mod stripe_events;
 pub mod subscriptions;
 
 use sqlx::{MySqlPool, mysql::MySqlPoolOptions};
