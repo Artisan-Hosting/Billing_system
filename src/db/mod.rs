@@ -4,6 +4,7 @@
 //! (`migrations/`), matching `domain_management`'s own convention.
 
 pub mod credits;
+pub mod customers;
 pub mod invoices;
 pub mod payment_intents;
 pub mod plans;

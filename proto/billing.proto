@@ -80,6 +80,11 @@ message CreatePaymentIntentRequest {
   // looking at the Stripe dashboard can trace a charge back to what it was
   // for. Not interpreted by Billing itself.
   map<string, string> metadata = 5;
+  // Optional: the Stripe Customer (cus_...) this charge belongs to. With
+  // `save_payment_method`, the card used is saved to that customer for later
+  // off-session charges (credit auto-reload). Ignored without a customer.
+  string stripe_customer_id = 6;
+  bool save_payment_method = 7;
 }
 
 // `id_or_reference` is either this service's own `PaymentIntent.id`, or
@@ -147,6 +152,19 @@ message StripeWebhookResponse {
 //    `domain_management::billing::BillingClient::organization_permits_new_purchases`,
 //    the first such caller.
 service BillingAdminService {
+  // Internal only, no end-user token -- called by whatever creates an
+  // organization, so every org has a billing account (a Stripe Customer)
+  // before it does anything else, including orgs that will only ever be
+  // invoiced $0.00 (Beta). Idempotent: an org that already has a customer is
+  // returned unchanged (`created` = false), so it is safe to call on every
+  // org creation, on retry, and to backfill existing orgs. Purchase RPCs
+  // (TopUpCredit, ...) call the same logic themselves as a safety net.
+  //
+  // `name`/`email` are optional and only used when the Stripe Customer is
+  // first created; they are for a human reading the Stripe dashboard and
+  // receipts. An existing customer's details are not updated by this call.
+  rpc EnsureCustomer(EnsureCustomerRequest) returns (BillingCustomer);
+
   // AUTHZ: access_token only (a read). Returns NOT_FOUND if the org has no
   // subscription in this storefront yet -- distinct from an empty/default
   // Subscription, so a caller can tell "never subscribed" from "subscribed
@@ -397,6 +415,21 @@ message OrgBillingStatus {
   // that would create the first one.
   BillingStatus status = 2;
   repeated SubscriptionStatusSummary subscriptions = 3;
+}
+
+message EnsureCustomerRequest {
+  string organization_id = 1;
+  string name = 2;
+  string email = 3;
+}
+
+message BillingCustomer {
+  string organization_id = 1;
+  string stripe_customer_id = 2;
+  // Whether a card has been saved for off-session charges.
+  bool has_default_payment_method = 3;
+  // True only on the call that created the Stripe Customer.
+  bool created = 4;
 }
 
 message GetCreditBalanceRequest {

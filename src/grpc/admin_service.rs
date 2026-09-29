@@ -239,6 +239,8 @@ async fn finalize_invoice_and_maybe_charge(
                 amount_cents: total_cents,
                 currency: "usd".to_owned(),
                 metadata: [("organization_id".to_owned(), organization_id.to_owned())].into(),
+                stripe_customer_id: String::new(),
+                save_payment_method: false,
             }))
             .await?
             .into_inner();
@@ -565,6 +567,17 @@ impl BillingAdminService for Billing {
         }))
     }
 
+    async fn ensure_customer(&self, request: Request<EnsureCustomerRequest>) -> Result<Response<BillingCustomer>, Status> {
+        let req = request.into_inner();
+        let (row, created) = Billing::ensure_customer(self, &req.organization_id, Some(&req.name), Some(&req.email)).await?;
+        Ok(Response::new(BillingCustomer {
+            organization_id: row.organization_id,
+            stripe_customer_id: row.stripe_customer_id,
+            has_default_payment_method: row.default_payment_method_id.is_some(),
+            created,
+        }))
+    }
+
     async fn get_credit_balance(&self, request: Request<GetCreditBalanceRequest>) -> Result<Response<CreditBalance>, Status> {
         let req = request.into_inner();
         let claims = self.caller(&req.access_token).await?;
@@ -603,6 +616,10 @@ impl BillingAdminService for Billing {
             return Err(Status::invalid_argument("minimum top-up is $25.00 (2500 cents)"));
         }
 
+        // Normally already created when the org was (`EnsureCustomer`); this
+        // covers an org that predates that, or a caller that skipped it.
+        let (customer, _) = self.ensure_customer(&organization_id, None, None).await?;
+
         let currency = if req.currency.is_empty() { "usd".to_owned() } else { req.currency.to_lowercase() };
         // Idempotent per (organization_id, amount_cents, minute) would be
         // nice but isn't how CreatePaymentIntent's idempotency works today
@@ -620,6 +637,10 @@ impl BillingAdminService for Billing {
                 amount_cents: req.amount_cents,
                 currency,
                 metadata: [("organization_id".to_owned(), organization_id)].into(),
+                // Every org has a billing account; the card used is saved to it
+                // so credit auto-reload can charge it off-session later.
+                stripe_customer_id: customer.stripe_customer_id,
+                save_payment_method: true,
             }))
             .await?
             .into_inner();

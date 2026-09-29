@@ -22,6 +22,7 @@ use tonic::{Request, Response, Status};
 use crate::auth::AuthClient;
 use crate::config::{Config, Secrets};
 use crate::db::credits as credits_db;
+use crate::db::customers as customers_db;
 use crate::db::payment_intents as pi_db;
 use crate::proto::billing::*;
 use crate::proto::billing::billing_service_server::BillingService;
@@ -137,7 +138,14 @@ impl BillingService for Billing {
 
         let stripe_pi = self
             .stripe
-            .create_payment_intent(req.amount_cents, &currency, &metadata, &idempotency_key)
+            .create_payment_intent(
+                req.amount_cents,
+                &currency,
+                &metadata,
+                Some(req.stripe_customer_id.as_str()).filter(|c| !c.is_empty()),
+                req.save_payment_method,
+                &idempotency_key,
+            )
             .await
             .map_err(Status::from)?;
 
@@ -285,6 +293,47 @@ impl BillingService for Billing {
 }
 
 impl Billing {
+    /// The organization's Stripe Customer, creating it (once) if it doesn't
+    /// exist yet. Returns the row and whether this call created it.
+    ///
+    /// Idempotent at two levels, guarding different retries: the database
+    /// row (a repeat call finds it and makes no Stripe call), and Stripe's
+    /// own idempotency key `customer:<org>` (this client retrying after a
+    /// timeout returns the original Customer rather than a duplicate).
+    /// Two truly concurrent first calls both reach Stripe with the same key,
+    /// get the same Customer back, and the insert is a no-op for the loser.
+    pub(crate) async fn ensure_customer(
+        &self,
+        organization_id: &str,
+        name: Option<&str>,
+        email: Option<&str>,
+    ) -> Result<(crate::db::customers::CustomerRow, bool), Status> {
+        if organization_id.is_empty() {
+            return Err(Status::invalid_argument("organization_id is required"));
+        }
+        if let Some(existing) = customers_db::find(&self.pool, organization_id).await.map_err(Status::from)? {
+            return Ok((existing, false));
+        }
+
+        let customer = self
+            .stripe
+            .create_customer(
+                name.filter(|v| !v.is_empty()),
+                email.filter(|v| !v.is_empty()),
+                &[("organization_id", organization_id)],
+                &format!("customer:{organization_id}"),
+            )
+            .await
+            .map_err(Status::from)?;
+        customers_db::insert(&self.pool, organization_id, &customer.id).await.map_err(Status::from)?;
+
+        let row = customers_db::find(&self.pool, organization_id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::internal("billing customer vanished mid-create"))?;
+        Ok((row, true))
+    }
+
     /// Acts on one signature-verified Stripe event. Split from
     /// [`BillingService::handle_stripe_webhook`] so it can be tested with
     /// crafted events, without having to sign them.
@@ -369,6 +418,19 @@ impl Billing {
             }
 
             self.credit_topup_if_any(payment_intent_id, object).await?;
+
+            // A card saved during this payment (`save_payment_method`) becomes
+            // the customer's default for off-session use, if they have none.
+            if let (Some(customer), Some(payment_method)) = (
+                object.get("customer").and_then(|v| v.as_str()).filter(|v| !v.is_empty()),
+                object.get("payment_method").and_then(|v| v.as_str()).filter(|v| !v.is_empty()),
+            ) {
+                if object.get("setup_future_usage").and_then(|v| v.as_str()).is_some() {
+                    customers_db::set_default_payment_method_if_none(&self.pool, customer, payment_method)
+                        .await
+                        .map_err(Status::from)?;
+                }
+            }
         }
 
         Ok(updated)
@@ -773,5 +835,100 @@ mod tests {
         let billing = test_billing().await;
         let status = billing.process_event(&json!({"type": "payment_intent.succeeded"})).await.unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    async fn billing_with_mock_stripe(responses: Vec<(u16, String)>) -> (Billing, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (base, requests) = crate::stripe::tests::mock_server(responses).await;
+        let mut billing = test_billing().await;
+        billing.stripe = StripeClient::with_base("sk_test_123", &base).unwrap();
+        (billing, requests)
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn ensure_customer_creates_one_stripe_customer_per_org_and_is_idempotent() {
+        // Only ONE canned response: a second Stripe call would find nothing listening.
+        let (billing, mut requests) = billing_with_mock_stripe(vec![(200, r#"{"id": "cus_new1"}"#.to_owned())]).await;
+        let org = unique("org");
+
+        let (row, created) = billing.ensure_customer(&org, Some("Acme Inc"), Some("billing@acme.test")).await.unwrap();
+        assert!(created);
+        assert_eq!(row.stripe_customer_id, "cus_new1");
+        assert_eq!(row.default_payment_method_id, None);
+
+        let request = requests.recv().await.unwrap();
+        assert!(request.contains(&format!("idempotency-key: customer:{org}")), "{request}");
+        assert!(request.contains(&format!("metadata%5Borganization_id%5D={org}")), "{request}");
+
+        let (again, created_again) = billing.ensure_customer(&org, None, None).await.unwrap();
+        assert!(!created_again, "an org that already has a customer is returned unchanged");
+        assert_eq!(again.stripe_customer_id, "cus_new1");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_stripe_failure_creates_no_local_customer_so_a_retry_can_succeed() {
+        let (billing, _requests) = billing_with_mock_stripe(vec![(
+            500,
+            r#"{"error": {"type": "api_error", "message": "boom"}}"#.to_owned(),
+        )])
+        .await;
+        let org = unique("org");
+        assert!(billing.ensure_customer(&org, None, None).await.is_err());
+        assert!(customers_db::find(&billing.pool, &org).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn ensure_customer_requires_an_organization_id() {
+        let billing = test_billing().await;
+        let status = billing.ensure_customer("", None, None).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_card_saved_during_a_topup_becomes_the_default_payment_method_once() {
+        let billing = test_billing().await;
+        let (org, cus) = (unique("org"), unique("cus"));
+        customers_db::insert(&billing.pool, &org, &cus).await.unwrap();
+
+        let saved = |pm: &str, pi: &str| {
+            json!({
+                "id": unique("evt"), "type": "payment_intent.succeeded",
+                "data": {"object": {
+                    "id": pi, "amount": 2500, "amount_received": 2500,
+                    "metadata": {"organization_id": org},
+                    "customer": cus, "payment_method": pm, "setup_future_usage": "off_session"
+                }}
+            })
+        };
+        let pi1 = seed_topup(&billing, 2_500).await;
+        billing.process_event(&saved("pm_first", &pi1)).await.unwrap();
+        let pi2 = seed_topup(&billing, 2_500).await;
+        billing.process_event(&saved("pm_second", &pi2)).await.unwrap();
+
+        let row = customers_db::find(&billing.pool, &org).await.unwrap().unwrap();
+        assert_eq!(row.default_payment_method_id.as_deref(), Some("pm_first"), "a later card must not silently replace the default");
+        assert_eq!(balance(&billing, &org).await, 50_000_000, "both top-ups still credited");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_payment_that_did_not_save_a_card_leaves_the_default_unset() {
+        let billing = test_billing().await;
+        let (org, cus) = (unique("org"), unique("cus"));
+        customers_db::insert(&billing.pool, &org, &cus).await.unwrap();
+
+        let pi = seed_topup(&billing, 2_500).await;
+        let event = json!({
+            "id": unique("evt"), "type": "payment_intent.succeeded",
+            "data": {"object": {
+                "id": pi, "amount": 2500, "amount_received": 2500,
+                "metadata": {"organization_id": org}, "customer": cus, "payment_method": "pm_x"
+            }}
+        });
+        billing.process_event(&event).await.unwrap();
+        assert_eq!(customers_db::find(&billing.pool, &org).await.unwrap().unwrap().default_payment_method_id, None);
     }
 }

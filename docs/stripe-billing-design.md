@@ -144,6 +144,15 @@ has to respect or the spreadsheet does not yet cover:
 
 ## Implementation order
 
+0. **Done (3):** Stripe Customer per organization. `billing_customers`
+   (migration 0010); internal `EnsureCustomer` RPC (idempotent, no end-user
+   token) for whatever creates an org to call, backfill-safe; `TopUpCredit`
+   calls the same logic as a safety net, attaches the customer to the
+   PaymentIntent and saves the card (`setup_future_usage=off_session`); the
+   first card saved becomes `default_payment_method_id` when the payment
+   succeeds. Stripe idempotency key `customer:<org>` + a unique DB row keep
+   it to one Customer per org. Customer name/email are set at creation only;
+   syncing later changes is not built yet.
 0. **Done (2):** webhook inbox (`stripe_events`, migration 0009) and credit
    crediting: `payment_intent.succeeded` for a `TopUpCredit` PaymentIntent
    credits `cents_to_micros(amount)` exactly once (ledger key `topup:<pi>`);

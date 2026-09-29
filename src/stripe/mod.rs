@@ -37,6 +37,11 @@ pub struct StripeClient {
 /// value into this service's proto enum is the gRPC handler's job, not
 /// this client's; this type only has to agree with Stripe.
 #[derive(Debug, Clone, Deserialize)]
+pub struct Customer {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct PaymentIntent {
     pub id: String,
     pub amount: i64,
@@ -63,7 +68,7 @@ impl StripeClient {
         Self::with_base(secret_key, LIVE_BASE)
     }
 
-    fn with_base(secret_key: &str, base: &str) -> Result<Self> {
+    pub(crate) fn with_base(secret_key: &str, base: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent(concat!("billing/", env!("CARGO_PKG_VERSION")))
@@ -86,19 +91,55 @@ impl StripeClient {
     /// the two protect against different retries -- ours against a caller
     /// retrying `CreatePaymentIntent`, Stripe's against *this* client
     /// retrying its own HTTP call to Stripe.
+    ///
+    /// With `customer`, the PaymentIntent belongs to that Stripe Customer;
+    /// with `save_payment_method` as well, the card the customer pays with
+    /// is saved to it for later off-session use (`setup_future_usage=
+    /// off_session`), which requires a customer.
     pub async fn create_payment_intent(
         &self,
         amount_cents: i64,
         currency: &str,
         metadata: &[(&str, &str)],
+        customer: Option<&str>,
+        save_payment_method: bool,
         idempotency_key: &str,
     ) -> Result<PaymentIntent> {
         let mut form: Vec<(String, String)> =
             vec![("amount".to_owned(), amount_cents.to_string()), ("currency".to_owned(), currency.to_owned())];
+        if let Some(customer) = customer {
+            form.push(("customer".to_owned(), customer.to_owned()));
+            if save_payment_method {
+                form.push(("setup_future_usage".to_owned(), "off_session".to_owned()));
+            }
+        }
         for (key, value) in metadata {
             form.push((format!("metadata[{key}]"), (*value).to_owned()));
         }
         self.send(reqwest::Method::POST, "payment_intents", &form, Some(idempotency_key)).await
+    }
+
+    /// Creates a Customer. The idempotency key makes a retried call (this
+    /// client timing out after Stripe committed) return the original
+    /// Customer instead of creating a duplicate.
+    pub async fn create_customer(
+        &self,
+        name: Option<&str>,
+        email: Option<&str>,
+        metadata: &[(&str, &str)],
+        idempotency_key: &str,
+    ) -> Result<Customer> {
+        let mut form: Vec<(String, String)> = Vec::new();
+        if let Some(name) = name {
+            form.push(("name".to_owned(), name.to_owned()));
+        }
+        if let Some(email) = email {
+            form.push(("email".to_owned(), email.to_owned()));
+        }
+        for (key, value) in metadata {
+            form.push((format!("metadata[{key}]"), (*value).to_owned()));
+        }
+        self.send(reqwest::Method::POST, "customers", &form, Some(idempotency_key)).await
     }
 
     pub async fn get_payment_intent(&self, id: &str) -> Result<PaymentIntent> {
@@ -109,13 +150,13 @@ impl StripeClient {
         self.send(reqwest::Method::POST, &format!("payment_intents/{id}/cancel"), &[], None).await
     }
 
-    async fn send(
+    async fn send<T: serde::de::DeserializeOwned>(
         &self,
         method: reqwest::Method,
         path: &str,
         form: &[(String, String)],
         idempotency_key: Option<&str>,
-    ) -> Result<PaymentIntent> {
+    ) -> Result<T> {
         if self.secret_key.is_empty() {
             return Err(Error::Stripe(format!("no Stripe secret key configured; cannot call {path}")));
         }
@@ -152,7 +193,7 @@ impl StripeClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -161,7 +202,7 @@ mod tests {
     /// `cloudflare::dns`/`cloudflare::registrar` tests use -- one canned
     /// `(status, body)` response per accepted connection, plus the raw
     /// request text sent back over a channel for assertions on it.
-    async fn mock_server(responses: Vec<(u16, String)>) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    pub(crate) async fn mock_server(responses: Vec<(u16, String)>) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -204,7 +245,7 @@ mod tests {
     async fn create_payment_intent_sends_a_form_encoded_body_with_basic_auth_and_idempotency_key() {
         let (base, mut requests) = mock_server(vec![(200, PAYMENT_INTENT_RESPONSE.to_owned())]).await;
         let result = client(&base)
-            .create_payment_intent(1099, "usd", &[("consumer", "domain_management")], "idem-key-1")
+            .create_payment_intent(1099, "usd", &[("consumer", "domain_management")], None, false, "idem-key-1")
             .await
             .unwrap();
 
@@ -265,7 +306,58 @@ mod tests {
     #[tokio::test]
     async fn create_payment_intent_refuses_without_a_secret_key() {
         let stripe_client = StripeClient::with_base("", "http://127.0.0.1:1").unwrap();
-        let err = stripe_client.create_payment_intent(100, "usd", &[], "key-1").await.unwrap_err();
+        let err = stripe_client.create_payment_intent(100, "usd", &[], None, false, "key-1").await.unwrap_err();
         assert!(err.to_string().contains("no Stripe secret key"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn create_payment_intent_attaches_the_customer_and_saves_the_card_only_when_asked() {
+        let (base, mut requests) = mock_server(vec![(200, PAYMENT_INTENT_RESPONSE.to_owned()); 3]).await;
+        let c = client(&base);
+
+        c.create_payment_intent(2500, "usd", &[], Some("cus_1"), true, "k1").await.unwrap();
+        let body = requests.recv().await.unwrap();
+        let body = body.split("\r\n\r\n").nth(1).unwrap_or_default().to_owned();
+        assert!(body.contains("customer=cus_1"), "{body}");
+        assert!(body.contains("setup_future_usage=off_session"), "{body}");
+
+        c.create_payment_intent(2500, "usd", &[], Some("cus_1"), false, "k2").await.unwrap();
+        let body = requests.recv().await.unwrap();
+        let body = body.split("\r\n\r\n").nth(1).unwrap_or_default().to_owned();
+        assert!(body.contains("customer=cus_1") && !body.contains("setup_future_usage"), "{body}");
+
+        // Saving a card without a customer is meaningless; nothing is sent for it.
+        c.create_payment_intent(2500, "usd", &[], None, true, "k3").await.unwrap();
+        let body = requests.recv().await.unwrap();
+        let body = body.split("\r\n\r\n").nth(1).unwrap_or_default().to_owned();
+        assert!(!body.contains("customer") && !body.contains("setup_future_usage"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn create_customer_posts_name_email_metadata_and_an_idempotency_key() {
+        let (base, mut requests) = mock_server(vec![(200, r#"{"id": "cus_123", "object": "customer"}"#.to_owned())]).await;
+        let customer = client(&base)
+            .create_customer(Some("Acme Inc"), Some("billing@acme.test"), &[("organization_id", "org-1")], "customer:org-1")
+            .await
+            .unwrap();
+        assert_eq!(customer.id, "cus_123");
+
+        let request = requests.recv().await.unwrap();
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(request_line.starts_with("POST /customers"), "{request_line}");
+        assert!(request.contains("idempotency-key: customer:org-1"), "{request}");
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(body.contains("name=Acme+Inc") || body.contains("name=Acme%20Inc"), "{body}");
+        assert!(body.contains("email=billing%40acme.test"), "{body}");
+        assert!(body.contains("metadata%5Borganization_id%5D=org-1"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn create_customer_omits_absent_name_and_email() {
+        let (base, mut requests) = mock_server(vec![(200, r#"{"id": "cus_9"}"#.to_owned())]).await;
+        client(&base).create_customer(None, None, &[("organization_id", "org-2")], "customer:org-2").await.unwrap();
+        let request = requests.recv().await.unwrap();
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(!body.contains("name=") && !body.contains("email="), "{body}");
     }
 }
