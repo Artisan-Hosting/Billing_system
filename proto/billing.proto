@@ -209,6 +209,10 @@ service BillingAdminService {
   // AUTHZ: access_token only (a read).
   rpc GetCreditBalance(GetCreditBalanceRequest) returns (CreditBalance);
 
+  // AUTHZ: access_token only (a read), same gate as GetCreditBalance.
+  // Newest entry first; `total` is the org's whole ledger so a UI can page.
+  rpc ListCreditLedger(ListCreditLedgerRequest) returns (ListCreditLedgerResponse);
+
   // AUTHZ: Action::Purchase on ResourceType::Subscription **and** an
   // elevated token, same bar as CreateOrUpgradeSubscription -- this spends
   // real money. Wraps BillingService's own CreatePaymentIntent (reuses
@@ -411,6 +415,27 @@ message CreditBalance {
   // being NULLable -- a real cap of exactly $0 is not a state this system
   // has any use for (it would mean "can never spend anything").
   int64 monthly_spend_cap_cents = 3;
+}
+
+message ListCreditLedgerRequest {
+  string access_token = 1;
+  string organization_id = 2;
+  int32 limit = 3;    // 0 means the default page size (50), capped at 200
+  int32 offset = 4;
+}
+
+message CreditLedgerEntry {
+  int64 id = 1;
+  string entry_type = 2;           // topup | debit | adjustment
+  int64 amount_cents = 3;          // signed: topups positive, debits negative
+  int64 balance_after_cents = 4;
+  string external_reference = 5;   // Stripe payment_intent id or session id; may be empty
+  int64 created_at = 6;            // unix seconds
+}
+
+message ListCreditLedgerResponse {
+  repeated CreditLedgerEntry entries = 1;
+  int64 total = 2;
 }
 
 message TopUpCreditRequest {

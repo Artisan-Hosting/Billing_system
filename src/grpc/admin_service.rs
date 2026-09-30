@@ -614,6 +614,37 @@ impl BillingAdminService for Billing {
         }))
     }
 
+    async fn list_credit_ledger(
+        &self,
+        request: Request<ListCreditLedgerRequest>,
+    ) -> Result<Response<ListCreditLedgerResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        let organization_id = self.scoped_org(&claims, &req.organization_id)?;
+        self.require_subscription_access(&claims, &organization_id, Action::Read, "not permitted to view billing")
+            .await?;
+
+        let limit = if req.limit > 0 { (req.limit as i64).min(200) } else { 50 };
+        let (rows, total) = credits_db::list_ledger(&self.pool, &organization_id, limit, (req.offset as i64).max(0))
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(ListCreditLedgerResponse {
+            entries: rows
+                .into_iter()
+                .map(|r| CreditLedgerEntry {
+                    id: r.id,
+                    entry_type: r.entry_type,
+                    amount_cents: r.amount_cents,
+                    balance_after_cents: r.balance_after_cents,
+                    external_reference: r.external_reference.unwrap_or_default(),
+                    created_at: r.created_at,
+                })
+                .collect(),
+            total,
+        }))
+    }
+
     /// AUTHZ: Action::Purchase on the `subscription` resource type **and**
     /// an elevated token, same bar as `create_or_upgrade_subscription` --
     /// see this RPC's own doc comment in `proto/billing.proto`.
@@ -648,7 +679,7 @@ impl BillingAdminService for Billing {
 
         let pi = self
             .create_payment_intent(Request::new(CreatePaymentIntentRequest {
-                consumer: "billing_credit_topup".to_owned(),
+                consumer: super::service::TOPUP_CONSUMER.to_owned(),
                 external_reference,
                 amount_cents: req.amount_cents,
                 currency,

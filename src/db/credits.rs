@@ -113,6 +113,55 @@ pub async fn apply_ledger_entry(
     Ok((new_balance, true))
 }
 
+#[derive(Debug, Clone)]
+pub struct LedgerEntryRow {
+    pub id: i64,
+    pub entry_type: String,
+    pub amount_cents: i64,
+    pub balance_after_cents: i64,
+    pub external_reference: Option<String>,
+    pub created_at: i64,
+}
+
+/// One page of an organization's ledger, newest first, plus the total row
+/// count. Ordered by `id` (not `created_at`) so entries written in the same
+/// second still have a stable order across pages.
+pub async fn list_ledger(
+    pool: &MySqlPool,
+    organization_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<LedgerEntryRow>, i64)> {
+    let rows = sqlx::query(
+        "SELECT id, entry_type, amount_cents, balance_after_cents, external_reference, \
+         UNIX_TIMESTAMP(created_at) AS created_at \
+         FROM credit_ledger_entries WHERE organization_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+    )
+    .bind(organization_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credit_ledger_entries WHERE organization_id = ?")
+        .bind(organization_id)
+        .fetch_one(pool)
+        .await?;
+
+    let entries = rows
+        .into_iter()
+        .map(|row| LedgerEntryRow {
+            id: row.get::<u64, _>("id") as i64,
+            entry_type: row.get("entry_type"),
+            amount_cents: row.get("amount_cents"),
+            balance_after_cents: row.get("balance_after_cents"),
+            external_reference: row.get("external_reference"),
+            created_at: row.get("created_at"),
+        })
+        .collect();
+    Ok((entries, total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +237,28 @@ mod tests {
 
         let (balance, _) = apply_ledger_entry(&pool, &org, "debit", -500, None, None).await.expect("debit");
         assert_eq!(balance, -500);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn the_ledger_lists_newest_first_and_a_replayed_topup_lands_once() {
+        let database_url = std::env::var("DATABASE_URL").expect("set DATABASE_URL to a migrated test database");
+        let pool = crate::db::connect(&database_url).await.expect("connect");
+        let org = unique_org();
+
+        apply_ledger_entry(&pool, &org, "topup", 2500, Some("pi_1"), Some("pi_1")).await.expect("topup");
+        let (_, applied) = apply_ledger_entry(&pool, &org, "topup", 2500, Some("pi_1"), Some("pi_1")).await.expect("replay");
+        assert!(!applied, "a replayed PaymentIntent must not credit twice");
+        apply_ledger_entry(&pool, &org, "debit", -700, Some("session-1"), None).await.expect("debit");
+
+        let (entries, total) = list_ledger(&pool, &org, 10, 0).await.expect("list");
+        assert_eq!(total, 2);
+        assert_eq!(entries[0].entry_type, "debit");
+        assert_eq!(entries[0].balance_after_cents, 1800);
+        assert_eq!(entries[1].amount_cents, 2500);
+
+        let (page2, _) = list_ledger(&pool, &org, 1, 1).await.expect("page 2");
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].entry_type, "topup");
     }
 }
