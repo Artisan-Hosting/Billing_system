@@ -97,6 +97,39 @@ impl Billing {
 
         Ok(claims.organization_id.clone())
     }
+
+    /// Whether `claims` may do `action` to this organization's billing, decided
+    /// by ais_auth's policy engine. The resource id is the **organization id**:
+    /// a subscription belongs to an organization, and ais_auth resolves that id
+    /// straight to its owning org -- so an Admin (an org-scoped Super) passes
+    /// for their own organization only, other roles pass only where the org's
+    /// policy says so, and a viewer sees nothing until the org opts them in.
+    /// `Super` is the platform operator's support bypass and skips the call,
+    /// as the policy engine would allow it anyway.
+    ///
+    /// A failure to reach ais_auth is an error (`Unavailable`), never a
+    /// silent denial or a silent allow.
+    async fn require_subscription_access(
+        &self,
+        claims: &Claims,
+        organization_id: &str,
+        action: Action,
+        denied: &'static str,
+    ) -> Result<(), Status> {
+        if claims.role == Role::Super {
+            return Ok(());
+        }
+        let allowed = self
+            .auth
+            .evaluate_access(claims, RESOURCE_TYPE_SUBSCRIPTION, organization_id, action)
+            .await
+            .map_err(Status::from)?;
+        if allowed {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(denied))
+        }
+    }
 }
 
 fn now() -> i64 {
@@ -266,6 +299,8 @@ impl BillingAdminService for Billing {
         let req = request.into_inner();
         let claims = self.caller(&req.access_token).await?;
         let organization_id = self.scoped_org(&claims, &req.organization_id)?;
+        self.require_subscription_access(&claims, &organization_id, Action::Read, "not permitted to view billing")
+            .await?;
 
         let row = sub_db::find(&self.pool, &organization_id, &req.storefront)
             .await
@@ -290,16 +325,9 @@ impl BillingAdminService for Billing {
             return Err(Status::failed_precondition("subscription purchasing is not enabled"));
         }
 
-        let allowed = self
-            .auth
-            .evaluate_access(&claims, RESOURCE_TYPE_SUBSCRIPTION, "", Action::Purchase)
-            .await
-            .map_err(Status::from)?;
-        if !allowed && claims.role != Role::Super {
-            return Err(Status::permission_denied("not permitted to purchase subscriptions"));
-        }
-
         let organization_id = self.scoped_org(&claims, &req.organization_id)?;
+        self.require_subscription_access(&claims, &organization_id, Action::Purchase, "not permitted to purchase subscriptions")
+            .await?;
 
         if !VALID_STOREFRONTS.contains(&req.storefront.as_str()) {
             return Err(Status::invalid_argument(format!("unknown storefront {:?}", req.storefront)));
@@ -403,6 +431,8 @@ impl BillingAdminService for Billing {
         let req = request.into_inner();
         let claims = self.caller(&req.access_token).await?;
         let organization_id = self.scoped_org(&claims, &req.organization_id)?;
+        self.require_subscription_access(&claims, &organization_id, Action::Write, "not permitted to change subscriptions")
+            .await?;
 
         let row = sub_db::find(&self.pool, &organization_id, &req.storefront)
             .await
@@ -442,6 +472,8 @@ impl BillingAdminService for Billing {
         let req = request.into_inner();
         let claims = self.caller(&req.access_token).await?;
         let organization_id = self.scoped_org(&claims, &req.organization_id)?;
+        self.require_subscription_access(&claims, &organization_id, Action::Write, "not permitted to change subscriptions")
+            .await?;
 
         let row = sub_db::find(&self.pool, &organization_id, &req.storefront)
             .await
@@ -517,6 +549,8 @@ impl BillingAdminService for Billing {
         let req = request.into_inner();
         let claims = self.caller(&req.access_token).await?;
         let organization_id = self.scoped_org(&claims, &req.organization_id)?;
+        self.require_subscription_access(&claims, &organization_id, Action::Read, "not permitted to view billing")
+            .await?;
 
         let limit = if req.limit > 0 { req.limit as i64 } else { 50 };
         let storefront = if req.storefront.is_empty() { None } else { Some(req.storefront.as_str()) };
@@ -569,6 +603,8 @@ impl BillingAdminService for Billing {
         let req = request.into_inner();
         let claims = self.caller(&req.access_token).await?;
         let organization_id = self.scoped_org(&claims, &req.organization_id)?;
+        self.require_subscription_access(&claims, &organization_id, Action::Read, "not permitted to view billing")
+            .await?;
 
         let account = credits_db::get_or_create(&self.pool, &organization_id).await.map_err(Status::from)?;
         Ok(Response::new(CreditBalance {
@@ -590,16 +626,9 @@ impl BillingAdminService for Billing {
             return Err(Status::failed_precondition("credit top-ups are not enabled"));
         }
 
-        let allowed = self
-            .auth
-            .evaluate_access(&claims, RESOURCE_TYPE_SUBSCRIPTION, "", Action::Purchase)
-            .await
-            .map_err(Status::from)?;
-        if !allowed && claims.role != Role::Super {
-            return Err(Status::permission_denied("not permitted to purchase credits"));
-        }
-
         let organization_id = self.scoped_org(&claims, &req.organization_id)?;
+        self.require_subscription_access(&claims, &organization_id, Action::Purchase, "not permitted to purchase credits")
+            .await?;
         if req.amount_cents < 2_500 {
             // $25 minimum, the Price Book's stated floor -- otherwise
             // Stripe's own per-transaction fee eats a meaningful share of a
