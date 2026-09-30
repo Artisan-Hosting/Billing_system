@@ -26,6 +26,10 @@ use crate::proto::billing::*;
 use crate::proto::billing::billing_service_server::BillingService;
 use crate::stripe::StripeClient;
 
+/// `payment_intents.consumer` for a credit top-up; the webhook credits the
+/// ledger only for PaymentIntents carrying this consumer.
+pub(crate) const TOPUP_CONSUMER: &str = "billing_credit_topup";
+
 /// Backs both `BillingService` (this file) and `BillingAdminService`
 /// (`grpc::admin_service`) -- one struct, two tonic services registered
 /// against the same gRPC server in `grpc::serve`. `Clone` so each
@@ -328,8 +332,104 @@ impl BillingService for Billing {
                 .await
                 .map_err(Status::from)?;
             }
+
+            credit_confirmed_topup(&self.pool, &event, &payment_intent_id).await.map_err(Status::from)?;
         }
 
         Ok(Response::new(StripeWebhookResponse { handled: updated }))
+    }
+}
+
+/// A credit top-up is only real once Stripe confirms it: this is the one
+/// place the ledger gets its `topup` row. The amount comes from our own row
+/// (written when we created the PaymentIntent), not from the event body, and
+/// the PaymentIntent id is the idempotency key, so Stripe re-delivering the
+/// event lands once. Returns whether a ledger entry was newly applied.
+pub(crate) async fn credit_confirmed_topup(
+    pool: &sqlx::MySqlPool,
+    event: &serde_json::Value,
+    payment_intent_id: &str,
+) -> crate::error::Result<bool> {
+    let Some(row) = pi_db::find_by_stripe_id(pool, payment_intent_id).await? else {
+        return Ok(false);
+    };
+    if row.consumer != TOPUP_CONSUMER {
+        return Ok(false);
+    }
+    let org = event
+        .pointer("/data/object/metadata/organization_id")
+        .and_then(|v| v.as_str())
+        .filter(|org| !org.is_empty());
+    let Some(org) = org else {
+        // Unrecoverable by retrying, so acknowledge rather than have Stripe
+        // re-send it for days; the row stays `succeeded` with no ledger entry
+        // for reconciliation.
+        eprintln!("billing: top-up {payment_intent_id} succeeded but carries no organization_id metadata");
+        return Ok(false);
+    };
+    let (_, applied) = crate::db::credits::apply_ledger_entry(
+        pool,
+        org,
+        "topup",
+        row.amount_cents,
+        Some(payment_intent_id),
+        Some(payment_intent_id),
+    )
+    .await?;
+    Ok(applied)
+}
+
+#[cfg(test)]
+mod topup_tests {
+    use super::*;
+
+    fn event(org: Option<&str>) -> serde_json::Value {
+        let mut obj = serde_json::json!({ "id": "pi_topup_test" });
+        if let Some(org) = org {
+            obj["metadata"] = serde_json::json!({ "organization_id": org });
+        }
+        serde_json::json!({ "type": "payment_intent.succeeded", "data": { "object": obj } })
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_confirmed_topup_credits_once_even_when_the_webhook_is_replayed() {
+        let database_url = std::env::var("DATABASE_URL").expect("set DATABASE_URL to a migrated test database");
+        let pool = crate::db::connect(&database_url).await.expect("connect");
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let org = format!("test-org-{nonce}");
+        let pi = format!("pi_topup_{nonce}");
+        let mut ev = event(Some(&org));
+        ev["data"]["object"]["id"] = serde_json::json!(pi);
+
+        pi_db::insert(&pool, &pi, TOPUP_CONSUMER, &format!("ref-{nonce}"), 5000, "usd", "requires_payment_method")
+            .await
+            .expect("seed payment intent");
+
+        assert!(credit_confirmed_topup(&pool, &ev, &pi).await.unwrap());
+        assert!(!credit_confirmed_topup(&pool, &ev, &pi).await.unwrap(), "replay must not credit twice");
+
+        let account = crate::db::credits::get_or_create(&pool, &org).await.unwrap();
+        assert_eq!(account.balance_cents, 5000);
+        let (entries, total) = crate::db::credits::list_ledger(&pool, &org, 10, 0).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(entries[0].entry_type, "topup");
+        assert_eq!(entries[0].external_reference.as_deref(), Some(pi.as_str()));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_non_topup_payment_or_missing_org_metadata_credits_nothing() {
+        let database_url = std::env::var("DATABASE_URL").expect("set DATABASE_URL to a migrated test database");
+        let pool = crate::db::connect(&database_url).await.expect("connect");
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let pi_other = format!("pi_other_{nonce}");
+        let pi_bare = format!("pi_bare_{nonce}");
+        pi_db::insert(&pool, &pi_other, "domain_management", &format!("o-{nonce}"), 1200, "usd", "succeeded").await.unwrap();
+        pi_db::insert(&pool, &pi_bare, TOPUP_CONSUMER, &format!("b-{nonce}"), 2500, "usd", "succeeded").await.unwrap();
+
+        assert!(!credit_confirmed_topup(&pool, &event(Some("org-x")), &pi_other).await.unwrap());
+        assert!(!credit_confirmed_topup(&pool, &event(None), &pi_bare).await.unwrap());
+        assert!(!credit_confirmed_topup(&pool, &event(Some("org-x")), "pi_unknown").await.unwrap());
     }
 }
