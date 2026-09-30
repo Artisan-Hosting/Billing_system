@@ -8,14 +8,10 @@
     // Serves reflection so `grpcurl -plaintext <addr> list` works.
     "reflection": true
   },
-  "http": {
-    // Address the usage-cost HTTP server (`POST /calculate`) binds to.
-    "bind": "0.0.0.0:3031"
-  },
   "auth": {
     // ais_auth's AccountInternal gRPC address. Use an `https://` mTLS
     // address in production; plaintext `http://` is local-dev only.
-    "grpc_addr": "http://127.0.0.1:50051",
+    "grpc_addr": "https://127.0.0.1:50051",
     "token_cache_secs": 60
   },
   "purchasing": {

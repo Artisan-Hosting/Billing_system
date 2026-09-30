@@ -1,15 +1,11 @@
 # Billing
 
-Internal gRPC gateway to Stripe, and the platform's usage-cost calculator.
-
-Two things live in this one process:
-
-- A gRPC service (`BillingService` / `BillingAdminService`, see
-  `proto/billing.proto`) that is the *one* place Stripe credentials live on
-  this platform -- any service that needs to charge a customer calls this
-  crate's gRPC rather than holding its own Stripe key.
-- The usage-cost HTTP endpoint (`POST /calculate`) used to price metered
-  overage against the plan catalog.
+Internal gRPC gateway to Stripe. It is the *one* place Stripe credentials live
+on this platform, and it owns plans, subscriptions, invoices and prepaid credit
+(`BillingService` / `BillingAdminService`, see `proto/billing.proto`). Any
+service that needs to charge a customer calls this crate's gRPC rather than
+holding its own Stripe key. Metered overage is priced by
+`BillingAdminService.RecordOverageUsage`. There is no HTTP surface.
 
 ## Configuration
 
@@ -45,10 +41,10 @@ A `Makefile` wraps the common commands (defaulting to the example config so
 ```
 make build     # cargo build
 make run       # run the server against examples/billing.json + billing.env
-make migrate   # apply pending database migrations and exit
+make migrate   # prints a reminder: migrations are applied by hand
 make test      # cargo test
 make check     # fmt-check + clippy + test
 ```
 
-Migrations live in `migrations/` and run automatically on `serve` as well as
-via `billing migrate`.
+Migrations live in `migrations/` and are applied by hand (`serve` and
+`billing migrate` do not run them).
