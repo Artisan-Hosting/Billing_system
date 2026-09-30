@@ -30,6 +30,13 @@ service BillingService {
   rpc WatchPaymentIntent(WatchPaymentIntentRequest) returns (stream PaymentIntent);
   rpc CancelPaymentIntent(CancelPaymentIntentRequest) returns (PaymentIntent);
 
+  // Internal only (mTLS). Refunds a *succeeded* PaymentIntent in full.
+  // Idempotent per PaymentIntent: asking again returns the refund that
+  // already exists instead of failing or refunding twice, so a caller that
+  // crashed between the refund and recording it can simply call again.
+  // FAILED_PRECONDITION if the payment never succeeded.
+  rpc RefundPaymentIntent(RefundPaymentIntentRequest) returns (RefundPaymentIntentResponse);
+
   // Called only by Portal's webhook-forwarding route (or whatever public
   // ingress relays Stripe's callback), which forwards the raw request body
   // and `Stripe-Signature` header untouched. This service verifies the
@@ -88,6 +95,11 @@ message CreatePaymentIntentRequest {
 // itself contains a colon is still handled correctly.
 message GetPaymentIntentRequest {
   string id_or_reference = 1;
+  // Also return `client_secret` and `publishable_key`, fetched from Stripe,
+  // so a caller can hand a customer the payment form for an intent created
+  // earlier (a retried order, a resumed checkout). Only honoured while the
+  // intent can still be paid; the secret is never stored here.
+  bool include_client_secret = 2;
 }
 
 message WatchPaymentIntentRequest {
@@ -96,6 +108,19 @@ message WatchPaymentIntentRequest {
 
 message CancelPaymentIntentRequest {
   string id_or_reference = 1;
+}
+
+message RefundPaymentIntentRequest {
+  string id_or_reference = 1;
+  // Free text kept with the refund for whoever audits it later.
+  string reason = 2;
+}
+
+message RefundPaymentIntentResponse {
+  string refund_id = 1;
+  // Stripe's own refund status: pending | succeeded | failed | canceled.
+  string status = 2;
+  int64 amount_cents = 3;
 }
 
 message StripeWebhookRequest {
@@ -198,6 +223,24 @@ service BillingAdminService {
   // domain_management's ListOrdersRequest is.
   rpc ListInvoices(ListInvoicesRequest) returns (ListInvoicesResponse);
 
+  // AUTHZ: access_token only -- the plan catalog is the public Price Book,
+  // not org data, so any signed-in caller may read it. `storefront` empty
+  // means every storefront. Inactive plans are never returned.
+  rpc ListPlans(ListPlansRequest) returns (ListPlansResponse);
+
+  // AUTHZ: same read gate as GetSubscription. Every subscription the org
+  // holds (one per storefront), so a UI needs one call, not one per
+  // storefront with NOT_FOUND meaning "none".
+  rpc ListSubscriptions(ListSubscriptionsRequest) returns (ListSubscriptionsResponse);
+
+  // AUTHZ: Action::Purchase on ResourceType::Subscription **and** an
+  // elevated token, same bar as CreateOrUpgradeSubscription. Re-attempts
+  // payment of an invoice that is still `open` by returning a
+  // `client_secret` for its existing PaymentIntent, rather than creating a
+  // second invoice for the same period. FAILED_PRECONDITION if the invoice
+  // is already paid or void.
+  rpc RetryInvoicePayment(RetryInvoicePaymentRequest) returns (SubscriptionCheckout);
+
   // Internal only, no end-user token -- the hot-path status check every
   // other service's purchase-gating calls before letting an org start a new
   // VM/GPU session/domain order. Returns the most severe status across
@@ -255,6 +298,10 @@ enum BillingStatus {
   BILLING_STATUS_GRACE_PERIOD = 3;
   BILLING_STATUS_SUSPENDED = 4;
   BILLING_STATUS_DELETED = 5;
+  // The customer cancelled and the paid period ran out. Not a failure
+  // state: it never blocks the org's other purchases, and buying the plan
+  // again starts a fresh period on the same row.
+  BILLING_STATUS_CANCELED = 6;
 }
 
 message Subscription {
@@ -380,6 +427,53 @@ message ListInvoicesRequest {
 
 message ListInvoicesResponse {
   repeated Invoice invoices = 1;
+  // The org's whole invoice count for the same filter, so a UI can page.
+  int64 total = 2;
+}
+
+message ListPlansRequest {
+  string access_token = 1;
+  string storefront = 2;   // empty means every storefront
+}
+
+// One metered unit of a plan, in the catalog's own unit codes.
+message PlanUnit {
+  string unit_code = 1;
+  double included_qty = 2;
+  // Cents per unit beyond `included_qty`. Only meaningful when
+  // `overage_billed` is true: a unit with no rate row is never charged for
+  // going over (see billing::overage), which is different from a rate of 0.
+  double overage_rate_cents_per_unit = 3;
+  bool overage_billed = 4;
+}
+
+message Plan {
+  string plan_code = 1;
+  string storefront = 2;
+  string display_name = 3;
+  int64 price_cents = 4;
+  string currency = 5;
+  repeated PlanUnit units = 6;
+}
+
+message ListPlansResponse {
+  repeated Plan plans = 1;
+}
+
+message ListSubscriptionsRequest {
+  string access_token = 1;
+  string organization_id = 2;
+}
+
+message ListSubscriptionsResponse {
+  repeated Subscription subscriptions = 1;
+}
+
+message RetryInvoicePaymentRequest {
+  string access_token = 1;
+  string organization_id = 2;
+  string invoice_id = 3;
+  string elevated_token = 4;
 }
 
 message GetOrganizationBillingStatusRequest {

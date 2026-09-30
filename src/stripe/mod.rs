@@ -46,6 +46,19 @@ pub struct PaymentIntent {
     pub client_secret: Option<String>,
 }
 
+/// The subset of Stripe's `Refund` object this service reads.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Refund {
+    pub id: String,
+    pub amount: i64,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefundList {
+    data: Vec<Refund>,
+}
+
 #[derive(Debug, Deserialize)]
 struct StripeErrorEnvelope {
     error: StripeErrorDetail,
@@ -54,6 +67,8 @@ struct StripeErrorEnvelope {
 #[derive(Debug, Deserialize)]
 struct StripeErrorDetail {
     message: String,
+    #[serde(default)]
+    code: Option<String>,
     #[serde(rename = "type")]
     error_type: String,
 }
@@ -109,13 +124,40 @@ impl StripeClient {
         self.send(reqwest::Method::POST, &format!("payment_intents/{id}/cancel"), &[], None).await
     }
 
-    async fn send(
+    /// Refunds the whole PaymentIntent. `Idempotency-Key` is per
+    /// PaymentIntent, so a retry inside Stripe's 24h key window returns the
+    /// same refund; after that window Stripe answers `charge_already_refunded`,
+    /// which is resolved by looking the existing refund up instead of failing.
+    pub async fn refund_payment_intent(&self, payment_intent_id: &str, reason: &str) -> Result<Refund> {
+        let mut form = vec![("payment_intent".to_owned(), payment_intent_id.to_owned())];
+        if !reason.is_empty() {
+            form.push(("metadata[reason]".to_owned(), reason.chars().take(400).collect()));
+        }
+        let key = format!("refund:{payment_intent_id}");
+        match self.send::<Refund>(reqwest::Method::POST, "refunds", &form, Some(&key)).await {
+            Ok(refund) => Ok(refund),
+            Err(Error::Stripe(msg)) if msg.contains("charge_already_refunded") => {
+                let list: RefundList = self
+                    .send(
+                        reqwest::Method::GET,
+                        &format!("refunds?payment_intent={payment_intent_id}&limit=1"),
+                        &[],
+                        None,
+                    )
+                    .await?;
+                list.data.into_iter().next().ok_or(Error::Stripe(msg))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn send<T: serde::de::DeserializeOwned>(
         &self,
         method: reqwest::Method,
         path: &str,
         form: &[(String, String)],
         idempotency_key: Option<&str>,
-    ) -> Result<PaymentIntent> {
+    ) -> Result<T> {
         if self.secret_key.is_empty() {
             return Err(Error::Stripe(format!("no Stripe secret key configured; cannot call {path}")));
         }
@@ -136,8 +178,10 @@ impl StripeClient {
         if !status.is_success() {
             if let Ok(envelope) = serde_json::from_str::<StripeErrorEnvelope>(&text) {
                 return Err(Error::Stripe(format!(
-                    "{path}: {} ({})",
-                    envelope.error.message, envelope.error.error_type
+                    "{path}: {} ({}{})",
+                    envelope.error.message,
+                    envelope.error.error_type,
+                    envelope.error.code.as_deref().map(|c| format!(", {c}")).unwrap_or_default()
                 )));
             }
             let snippet: String = text.chars().take(500).collect();
@@ -267,5 +311,40 @@ mod tests {
         let stripe_client = StripeClient::with_base("", "http://127.0.0.1:1").unwrap();
         let err = stripe_client.create_payment_intent(100, "usd", &[], "key-1").await.unwrap_err();
         assert!(err.to_string().contains("no Stripe secret key"), "{err}");
+    }
+    #[tokio::test]
+    async fn a_refund_names_the_payment_intent_and_is_keyed_per_payment_intent() {
+        let body = r#"{"id":"re_1","object":"refund","amount":1157,"status":"succeeded"}"#;
+        let (base, mut requests) = mock_server(vec![(200, body.to_owned())]).await;
+        let refund = client(&base).refund_payment_intent("pi_123", "registration failed").await.unwrap();
+
+        assert_eq!((refund.id.as_str(), refund.amount, refund.status.as_str()), ("re_1", 1157, "succeeded"));
+        let request = requests.recv().await.unwrap();
+        assert!(request.lines().next().unwrap_or_default().starts_with("POST /refunds"), "{request}");
+        assert!(request.contains("idempotency-key: refund:pi_123"), "{request}");
+        let form = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(form.contains("payment_intent=pi_123"), "{form}");
+        assert!(form.contains("metadata%5Breason%5D=registration+failed"), "{form}");
+    }
+
+    #[tokio::test]
+    async fn refunding_twice_past_the_key_window_returns_the_existing_refund() {
+        let already = r#"{"error":{"message":"Charge ch_1 has already been refunded.","type":"invalid_request_error","code":"charge_already_refunded"}}"#;
+        let list = r#"{"object":"list","data":[{"id":"re_1","object":"refund","amount":1157,"status":"succeeded"}]}"#;
+        let (base, mut requests) = mock_server(vec![(400, already.to_owned()), (200, list.to_owned())]).await;
+        let refund = client(&base).refund_payment_intent("pi_123", "").await.unwrap();
+        assert_eq!(refund.id, "re_1");
+
+        let _post = requests.recv().await.unwrap();
+        let get = requests.recv().await.unwrap();
+        assert!(get.lines().next().unwrap_or_default().starts_with("GET /refunds?payment_intent=pi_123"), "{get}");
+    }
+
+    #[tokio::test]
+    async fn any_other_refund_error_is_surfaced() {
+        let other = r#"{"error":{"message":"No such payment_intent","type":"invalid_request_error","code":"resource_missing"}}"#;
+        let (base, _requests) = mock_server(vec![(404, other.to_owned())]).await;
+        let err = client(&base).refund_payment_intent("pi_nope", "").await.unwrap_err();
+        assert!(err.to_string().contains("No such payment_intent"), "{err}");
     }
 }

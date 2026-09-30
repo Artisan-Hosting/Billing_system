@@ -193,6 +193,29 @@ pub async fn list_for_org(
     Ok(rows.into_iter().map(row_to_invoice).collect())
 }
 
+/// Same filter as [`list_for_org`], for paging.
+pub async fn count_for_org(pool: &MySqlPool, organization_id: &str, storefront: Option<&str>) -> Result<i64> {
+    let count: i64 = match storefront {
+        Some(storefront) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM invoices i JOIN subscriptions s ON s.id = i.subscription_id \
+                 WHERE i.organization_id = ? AND s.storefront = ?",
+            )
+            .bind(organization_id)
+            .bind(storefront)
+            .fetch_one(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE organization_id = ?")
+                .bind(organization_id)
+                .fetch_one(pool)
+                .await?
+        }
+    };
+    Ok(count)
+}
+
 pub async fn line_items(pool: &MySqlPool, invoice_id: u64) -> Result<Vec<InvoiceLineItemRow>> {
     let rows = sqlx::query(
         "SELECT id, invoice_id, unit_code, description, CAST(quantity AS DOUBLE) AS quantity, \

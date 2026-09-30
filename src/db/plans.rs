@@ -43,6 +43,30 @@ pub async fn find(pool: &MySqlPool, plan_code: &str) -> Result<Option<PlanRow>> 
     }))
 }
 
+/// Every plan still on sale, cheapest first within a storefront.
+pub async fn list_active(pool: &MySqlPool, storefront: Option<&str>) -> Result<Vec<PlanRow>> {
+    let rows = sqlx::query(
+        "SELECT plan_code, storefront, display_name, price_cents, currency, active FROM plans \
+         WHERE active = TRUE AND (? IS NULL OR storefront = ?) ORDER BY storefront, price_cents, plan_code",
+    )
+    .bind(storefront)
+    .bind(storefront)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| PlanRow {
+            plan_code: row.get("plan_code"),
+            storefront: row.get("storefront"),
+            display_name: row.get("display_name"),
+            price_cents: row.get("price_cents"),
+            currency: row.get("currency"),
+            active: row.get("active"),
+        })
+        .collect())
+}
+
 /// `Err(Error::NotFound)` if `plan_code` isn't in the catalog at all --
 /// distinct from "this plan has no allowances/rates rows," which is a
 /// legitimate (if unusual) state that returns an empty map instead.
