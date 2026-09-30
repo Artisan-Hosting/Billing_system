@@ -48,7 +48,23 @@ pub async fn serve(config: Config, secrets: Secrets, pool: MySqlPool) -> Result<
     let tls_config = tonic::transport::ServerTlsConfig::new().identity(identity).client_ca_root(ca_cert);
 
     let reflection_enabled = config.grpc.reflection;
+    let purchasing_enabled = config.purchasing.enabled;
     let service = service::Billing::new(config, secrets, pool)?;
+
+    // Renewals create invoices and PaymentIntents, so the job runs only when
+    // purchasing is on -- the same switch that gates every other charge.
+    if purchasing_enabled {
+        let job = service.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(crate::rollover::TICK_SECONDS));
+            loop {
+                tick.tick().await;
+                if let Err(e) = crate::rollover::run_once(&job, chrono::Utc::now().timestamp()).await {
+                    log!(LogLevel::Error, "period rollover pass failed: {e}");
+                }
+            }
+        });
+    }
 
     let mut builder =
         Server::builder().tls_config(tls_config).map_err(|e| Error::Config(format!("failed to configure TLS: {e}")))?;
