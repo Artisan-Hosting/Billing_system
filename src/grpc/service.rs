@@ -182,7 +182,59 @@ impl BillingService for Billing {
             .map_err(Status::from)?
             .ok_or_else(|| Status::not_found(format!("no payment intent {}", req.id_or_reference)))?;
 
+        if req.include_client_secret && !is_terminal(&row.status) {
+            // Fetched from Stripe each time and passed straight through --
+            // never written down here. Stripe's own status is authoritative
+            // for "can this still be paid", so a stale local row can't hand
+            // out a secret for a dead intent.
+            let stripe_pi = self.stripe.get_payment_intent(&row.stripe_payment_intent_id).await.map_err(Status::from)?;
+            if !is_terminal(&stripe_pi.status) {
+                let mut response = row_response(row, stripe_pi.client_secret);
+                response.status = status_code(&stripe_pi.status);
+                response.publishable_key = self.secrets.stripe_publishable_key.clone();
+                return Ok(Response::new(response));
+            }
+        }
+
         Ok(Response::new(row_response(row, None)))
+    }
+
+    /// Internal only. Refunds a succeeded PaymentIntent in full; see the
+    /// RPC's own doc comment in `proto/billing.proto` for the idempotency
+    /// contract.
+    async fn refund_payment_intent(
+        &self,
+        request: Request<RefundPaymentIntentRequest>,
+    ) -> Result<Response<RefundPaymentIntentResponse>, Status> {
+        let req = request.into_inner();
+        let row = pi_db::find(&self.pool, &req.id_or_reference)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no payment intent {}", req.id_or_reference)))?;
+
+        // The local row only learns "succeeded" from the webhook, which can
+        // lag the charge; ask Stripe rather than refusing a real payment.
+        if row.status != "succeeded" {
+            let stripe_pi = self.stripe.get_payment_intent(&row.stripe_payment_intent_id).await.map_err(Status::from)?;
+            if stripe_pi.status != "succeeded" {
+                return Err(Status::failed_precondition(format!(
+                    "payment intent {} is {}, there is nothing to refund",
+                    req.id_or_reference, stripe_pi.status
+                )));
+            }
+        }
+
+        let refund = self
+            .stripe
+            .refund_payment_intent(&row.stripe_payment_intent_id, &req.reason)
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(RefundPaymentIntentResponse {
+            refund_id: refund.id,
+            status: refund.status,
+            amount_cents: refund.amount,
+        }))
     }
 
     type WatchPaymentIntentStream =

@@ -30,6 +30,13 @@ service BillingService {
   rpc WatchPaymentIntent(WatchPaymentIntentRequest) returns (stream PaymentIntent);
   rpc CancelPaymentIntent(CancelPaymentIntentRequest) returns (PaymentIntent);
 
+  // Internal only (mTLS). Refunds a *succeeded* PaymentIntent in full.
+  // Idempotent per PaymentIntent: asking again returns the refund that
+  // already exists instead of failing or refunding twice, so a caller that
+  // crashed between the refund and recording it can simply call again.
+  // FAILED_PRECONDITION if the payment never succeeded.
+  rpc RefundPaymentIntent(RefundPaymentIntentRequest) returns (RefundPaymentIntentResponse);
+
   // Called only by Portal's webhook-forwarding route (or whatever public
   // ingress relays Stripe's callback), which forwards the raw request body
   // and `Stripe-Signature` header untouched. This service verifies the
@@ -88,6 +95,11 @@ message CreatePaymentIntentRequest {
 // itself contains a colon is still handled correctly.
 message GetPaymentIntentRequest {
   string id_or_reference = 1;
+  // Also return `client_secret` and `publishable_key`, fetched from Stripe,
+  // so a caller can hand a customer the payment form for an intent created
+  // earlier (a retried order, a resumed checkout). Only honoured while the
+  // intent can still be paid; the secret is never stored here.
+  bool include_client_secret = 2;
 }
 
 message WatchPaymentIntentRequest {
@@ -96,6 +108,19 @@ message WatchPaymentIntentRequest {
 
 message CancelPaymentIntentRequest {
   string id_or_reference = 1;
+}
+
+message RefundPaymentIntentRequest {
+  string id_or_reference = 1;
+  // Free text kept with the refund for whoever audits it later.
+  string reason = 2;
+}
+
+message RefundPaymentIntentResponse {
+  string refund_id = 1;
+  // Stripe's own refund status: pending | succeeded | failed | canceled.
+  string status = 2;
+  int64 amount_cents = 3;
 }
 
 message StripeWebhookRequest {
