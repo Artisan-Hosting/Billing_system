@@ -28,7 +28,7 @@ struct Cli {
 enum Command {
     /// Run the gRPC service and the usage-cost HTTP server (the default).
     Serve,
-    /// Apply pending database migrations and exit.
+    /// Reminder only: migrations are applied by hand (see README).
     Migrate,
 }
 
@@ -59,7 +59,7 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(config, secrets).await,
         Command::Migrate => {
-            log!(LogLevel::Info, "migrations must be run manually");
+            log!(LogLevel::Info, "migrations are applied by hand, in order, from migrations/ (see README); nothing was run");
             Ok(())
         }
     }

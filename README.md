@@ -45,10 +45,12 @@ A `Makefile` wraps the common commands (defaulting to the example config so
 ```
 make build     # cargo build
 make run       # run the server against examples/billing.json + billing.env
-make migrate   # apply pending database migrations and exit
+make migrate   # no-op reminder: migrations are applied by hand (see below)
 make test      # cargo test
 make check     # fmt-check + clippy + test
 ```
 
-Migrations live in `migrations/` and run automatically on `serve` as well as
-via `billing migrate`.
+Migrations live in `migrations/` and are applied **by hand**, in order
+(`mysql billing < migrations/0001_init.sql`, then 0002, ...). Neither `serve`
+nor `billing migrate` applies them -- software migrations were switched off
+across the platform's services, and `migrate` only logs a reminder.

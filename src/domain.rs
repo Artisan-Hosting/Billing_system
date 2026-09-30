@@ -41,6 +41,10 @@ pub enum BillingStatus {
     /// Terminal -- a deleted subscription is never reactivated, a new one is
     /// created instead.
     Deleted,
+    /// The customer cancelled and the paid period ran out (see
+    /// `rollover`). Not a failure: it never blocks the org's other
+    /// purchases, and buying the plan again restarts the same row.
+    Canceled,
 }
 
 /// Returned by [`BillingStatus::from_str_name`] for an unrecognized wire
@@ -65,6 +69,7 @@ impl BillingStatus {
             BillingStatus::GracePeriod => "grace_period",
             BillingStatus::Suspended => "suspended",
             BillingStatus::Deleted => "deleted",
+            BillingStatus::Canceled => "canceled",
         }
     }
 
@@ -75,6 +80,7 @@ impl BillingStatus {
             "grace_period" => Ok(BillingStatus::GracePeriod),
             "suspended" => Ok(BillingStatus::Suspended),
             "deleted" => Ok(BillingStatus::Deleted),
+            "canceled" => Ok(BillingStatus::Canceled),
             _ => Err(BillingStatusParseError(s.to_owned())),
         }
     }
@@ -86,7 +92,7 @@ impl BillingStatus {
     /// resources are stopped at grace-period end, not at the first missed
     /// payment.
     pub fn permits_new_purchases(&self) -> bool {
-        matches!(self, BillingStatus::Active | BillingStatus::PastDue)
+        matches!(self, BillingStatus::Active | BillingStatus::PastDue | BillingStatus::Canceled)
     }
 }
 
@@ -102,6 +108,7 @@ mod tests {
             BillingStatus::GracePeriod,
             BillingStatus::Suspended,
             BillingStatus::Deleted,
+            BillingStatus::Canceled,
         ] {
             assert_eq!(BillingStatus::from_str_name(status.as_str_name()), Ok(status));
         }
@@ -115,7 +122,8 @@ mod tests {
     }
 
     #[test]
-    fn only_active_and_past_due_permit_new_purchases() {
+    fn only_active_past_due_and_canceled_permit_new_purchases() {
+        assert!(BillingStatus::Canceled.permits_new_purchases());
         assert!(BillingStatus::Active.permits_new_purchases());
         assert!(BillingStatus::PastDue.permits_new_purchases());
         assert!(!BillingStatus::GracePeriod.permits_new_purchases());

@@ -107,6 +107,30 @@ pub async fn set_plan(pool: &MySqlPool, id: u64, plan_code: &str) -> Result<()> 
     Ok(())
 }
 
+/// Buying again after a cancellation ran out: same row, fresh period, no
+/// queued downgrade, no pending cancel.
+pub async fn restart(
+    pool: &MySqlPool,
+    id: u64,
+    plan_code: &str,
+    status: &str,
+    period_start: i64,
+    period_end: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE subscriptions SET plan_code = ?, status = ?, pending_plan_code = NULL, cancel_at_period_end = FALSE, \
+         current_period_start = FROM_UNIXTIME(?), current_period_end = FROM_UNIXTIME(?) WHERE id = ?",
+    )
+    .bind(plan_code)
+    .bind(status)
+    .bind(period_start)
+    .bind(period_end)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn set_status(pool: &MySqlPool, id: u64, status: &str) -> Result<()> {
     sqlx::query("UPDATE subscriptions SET status = ? WHERE id = ?").bind(status).bind(id).execute(pool).await?;
     Ok(())

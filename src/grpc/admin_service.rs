@@ -143,6 +143,7 @@ fn billing_status_to_i32(status: &str) -> i32 {
         Ok(BillingStatus::GracePeriod) => proto_status::GracePeriod as i32,
         Ok(BillingStatus::Suspended) => proto_status::Suspended as i32,
         Ok(BillingStatus::Deleted) => proto_status::Deleted as i32,
+        Ok(BillingStatus::Canceled) => proto_status::Canceled as i32,
         // Unreachable in practice -- this service is the only writer of
         // `subscriptions.status`, and only ever writes a value produced by
         // `BillingStatus::as_str_name()`. Falling back to UNSPECIFIED rather
@@ -166,7 +167,7 @@ mod proto_status {
 fn most_severe_status(subscriptions: &[sub_db::SubscriptionRow]) -> &'static str {
     fn severity(status: &str) -> u8 {
         match BillingStatus::from_str_name(status) {
-            Ok(BillingStatus::Active) => 0,
+            Ok(BillingStatus::Active) | Ok(BillingStatus::Canceled) => 0,
             Ok(BillingStatus::PastDue) => 1,
             Ok(BillingStatus::GracePeriod) => 2,
             Ok(BillingStatus::Suspended) => 3,
@@ -175,9 +176,12 @@ fn most_severe_status(subscriptions: &[sub_db::SubscriptionRow]) -> &'static str
         }
     }
 
+    // A cancelled subscription is an org that stopped buying that product,
+    // not one in trouble: left in, it could tie with `Active` and win.
     subscriptions
         .iter()
         .map(|s| s.status.as_str())
+        .filter(|s| *s != BillingStatus::Canceled.as_str_name())
         .max_by_key(|s| severity(s))
         .map(|s| match BillingStatus::from_str_name(s) {
             Ok(BillingStatus::Active) => BillingStatus::Active.as_str_name(),
@@ -185,7 +189,7 @@ fn most_severe_status(subscriptions: &[sub_db::SubscriptionRow]) -> &'static str
             Ok(BillingStatus::GracePeriod) => BillingStatus::GracePeriod.as_str_name(),
             Ok(BillingStatus::Suspended) => BillingStatus::Suspended.as_str_name(),
             Ok(BillingStatus::Deleted) => BillingStatus::Deleted.as_str_name(),
-            Err(_) => BillingStatus::Active.as_str_name(),
+            Ok(BillingStatus::Canceled) | Err(_) => BillingStatus::Active.as_str_name(),
         })
         .unwrap_or(BillingStatus::Active.as_str_name())
 }
@@ -293,6 +297,33 @@ async fn finalize_invoice_and_maybe_charge(
     Ok((invoice, payment_intent))
 }
 
+/// Makes sure an `open` invoice has a PaymentIntent to pay, and returns its
+/// Stripe id. Idempotent: an invoice that already has one is returned as-is,
+/// and `create_payment_intent` itself is idempotent per
+/// `(consumer, invoice id)`, so a crash between the Stripe call and writing
+/// the id back only ever costs a retry. Shared by the period rollover job
+/// (which creates invoices with no PaymentIntent) and `RetryInvoicePayment`.
+pub(crate) async fn ensure_invoice_payment_intent(billing: &Billing, invoice: &inv_db::InvoiceRow) -> Result<String, Status> {
+    if let Some(existing) = &invoice.stripe_payment_intent_id {
+        return Ok(existing.clone());
+    }
+
+    let pi = billing
+        .create_payment_intent(Request::new(CreatePaymentIntentRequest {
+            consumer: PAYMENT_CONSUMER.to_owned(),
+            external_reference: invoice.id.to_string(),
+            amount_cents: invoice.total_cents,
+            currency: invoice.currency.clone(),
+            metadata: [("organization_id".to_owned(), invoice.organization_id.clone())].into(),
+        }))
+        .await?
+        .into_inner();
+    inv_db::set_stripe_payment_intent(&billing.pool, invoice.id, &pi.stripe_payment_intent_id)
+        .await
+        .map_err(Status::from)?;
+    Ok(pi.stripe_payment_intent_id)
+}
+
 #[tonic::async_trait]
 impl BillingAdminService for Billing {
     async fn get_subscription(&self, request: Request<GetSubscriptionRequest>) -> Result<Response<Subscription>, Status> {
@@ -347,7 +378,11 @@ impl BillingAdminService for Billing {
             )));
         }
 
-        let existing = sub_db::find(&self.pool, &organization_id, &req.storefront).await.map_err(Status::from)?;
+        let found = sub_db::find(&self.pool, &organization_id, &req.storefront).await.map_err(Status::from)?;
+        // A subscription whose cancellation already ran out is bought afresh
+        // (same row, new period) rather than upgraded from the old plan.
+        let restarting = found.as_ref().filter(|r| r.status == BillingStatus::Canceled.as_str_name()).map(|r| r.id);
+        let existing = found.filter(|r| r.status != BillingStatus::Canceled.as_str_name());
         let now = now();
 
         let (subscription_id, old_price_cents, period_start, period_end) = match &existing {
@@ -358,7 +393,7 @@ impl BillingAdminService for Billing {
                     .ok_or_else(|| Status::internal(format!("subscription references unknown plan {:?}", row.plan_code)))?;
                 old_plan.price_cents
             }, row.current_period_start, row.current_period_end),
-            None => (0, 0, now, now + DEFAULT_PERIOD_SECONDS),
+            None => (restarting.unwrap_or(0), 0, now, now + DEFAULT_PERIOD_SECONDS),
         };
 
         if plan.price_cents <= old_price_cents && existing.is_some() {
@@ -371,6 +406,14 @@ impl BillingAdminService for Billing {
             crate::proration::prorate_upgrade_charge(old_price_cents, plan.price_cents, now, period_start, period_end);
 
         let subscription_id = match subscription_id {
+            id if existing.is_none() && restarting.is_some() => {
+                let status =
+                    if charge_cents <= 0 { BillingStatus::Active.as_str_name() } else { BillingStatus::PastDue.as_str_name() };
+                sub_db::restart(&self.pool, id, &req.plan_code, status, period_start, period_end)
+                    .await
+                    .map_err(Status::from)?;
+                id
+            }
             0 => {
                 // Brand new: starts PastDue (not Active) until the invoice
                 // created below is actually paid -- unless it's free, in
@@ -565,7 +608,135 @@ impl BillingAdminService for Billing {
             invoices.push(invoice_row_to_proto(&row, items));
         }
 
-        Ok(Response::new(ListInvoicesResponse { invoices }))
+        let total = inv_db::count_for_org(&self.pool, &organization_id, storefront).await.map_err(Status::from)?;
+
+        Ok(Response::new(ListInvoicesResponse { invoices, total }))
+    }
+
+    /// Any signed-in caller: the catalog is the public Price Book.
+    async fn list_plans(&self, request: Request<ListPlansRequest>) -> Result<Response<ListPlansResponse>, Status> {
+        let req = request.into_inner();
+        self.caller(&req.access_token).await?;
+
+        let storefront = if req.storefront.is_empty() { None } else { Some(req.storefront.as_str()) };
+        let rows = plans_db::list_active(&self.pool, storefront).await.map_err(Status::from)?;
+
+        let mut plans = Vec::with_capacity(rows.len());
+        for row in rows {
+            let catalog = plans_db::allowances_and_rates_for_plan(&self.pool, &row.plan_code)
+                .await
+                .map_err(Status::from)?;
+            let mut units: Vec<PlanUnit> = catalog
+                .allowances
+                .iter()
+                .map(|(unit_code, included)| PlanUnit {
+                    unit_code: unit_code.clone(),
+                    included_qty: *included,
+                    overage_rate_cents_per_unit: catalog.rates.get(unit_code).copied().unwrap_or(0.0),
+                    overage_billed: catalog.rates.contains_key(unit_code),
+                })
+                .collect();
+            units.sort_by(|a, b| a.unit_code.cmp(&b.unit_code));
+            plans.push(Plan {
+                plan_code: row.plan_code,
+                storefront: row.storefront,
+                display_name: row.display_name,
+                price_cents: row.price_cents,
+                currency: row.currency,
+                units,
+            });
+        }
+
+        Ok(Response::new(ListPlansResponse { plans }))
+    }
+
+    async fn list_subscriptions(
+        &self,
+        request: Request<ListSubscriptionsRequest>,
+    ) -> Result<Response<ListSubscriptionsResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        let organization_id = self.scoped_org(&claims, &req.organization_id)?;
+        self.require_subscription_access(&claims, &organization_id, Action::Read, "not permitted to view billing")
+            .await?;
+
+        let rows = sub_db::list_for_org(&self.pool, &organization_id).await.map_err(Status::from)?;
+        Ok(Response::new(ListSubscriptionsResponse { subscriptions: rows.iter().map(subscription_row_to_proto).collect() }))
+    }
+
+    /// AUTHZ: Action::Purchase on the `subscription` resource type **and**
+    /// an elevated token -- see this RPC's own doc comment in
+    /// `proto/billing.proto`.
+    async fn retry_invoice_payment(
+        &self,
+        request: Request<RetryInvoicePaymentRequest>,
+    ) -> Result<Response<SubscriptionCheckout>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        self.elevated(&req.elevated_token, &claims).await?;
+
+        if !self.config.purchasing.enabled {
+            return Err(Status::failed_precondition("subscription purchasing is not enabled"));
+        }
+
+        let organization_id = self.scoped_org(&claims, &req.organization_id)?;
+        self.require_subscription_access(&claims, &organization_id, Action::Purchase, "not permitted to purchase subscriptions")
+            .await?;
+
+        let invoice_id: u64 = req.invoice_id.parse().map_err(|_| Status::invalid_argument("invoice_id is not a number"))?;
+        // Another org's invoice is indistinguishable from a missing one.
+        let invoice = inv_db::find(&self.pool, invoice_id)
+            .await
+            .map_err(Status::from)?
+            .filter(|i| i.organization_id == organization_id)
+            .ok_or_else(|| Status::not_found("no such invoice"))?;
+        if invoice.status != "open" {
+            return Err(Status::failed_precondition(format!("invoice is {}, nothing to pay", invoice.status)));
+        }
+
+        let mut stripe_id = ensure_invoice_payment_intent(self, &invoice).await?;
+        let mut stripe_pi = self.stripe.get_payment_intent(&stripe_id).await.map_err(Status::from)?;
+
+        if stripe_pi.status == "succeeded" {
+            // Paid, and the webhook just hasn't landed yet.
+            return Err(Status::failed_precondition("this invoice is already paid; confirmation is on its way"));
+        }
+        if stripe_pi.status == "canceled" {
+            // A cancelled PaymentIntent can't be paid. Replace it, keyed on
+            // the dead one's id so a retry of this same call is idempotent.
+            let replacement = self
+                .create_payment_intent(Request::new(CreatePaymentIntentRequest {
+                    consumer: PAYMENT_CONSUMER.to_owned(),
+                    external_reference: format!("{}:after:{stripe_id}", invoice.id),
+                    amount_cents: invoice.total_cents,
+                    currency: invoice.currency.clone(),
+                    metadata: [("organization_id".to_owned(), organization_id.clone())].into(),
+                }))
+                .await?
+                .into_inner();
+            inv_db::set_stripe_payment_intent(&self.pool, invoice.id, &replacement.stripe_payment_intent_id)
+                .await
+                .map_err(Status::from)?;
+            stripe_id = replacement.stripe_payment_intent_id;
+            stripe_pi = self.stripe.get_payment_intent(&stripe_id).await.map_err(Status::from)?;
+        }
+
+        let invoice = inv_db::find(&self.pool, invoice.id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::internal("invoice vanished mid-retry"))?;
+        let items = inv_db::line_items(&self.pool, invoice.id).await.map_err(Status::from)?;
+        let subscription = match invoice.subscription_id {
+            Some(id) => sub_db::find_by_id(&self.pool, id).await.map_err(Status::from)?,
+            None => None,
+        };
+
+        Ok(Response::new(SubscriptionCheckout {
+            subscription: subscription.as_ref().map(subscription_row_to_proto),
+            invoice: Some(invoice_row_to_proto(&invoice, items)),
+            stripe_client_secret: stripe_pi.client_secret.unwrap_or_default(),
+            stripe_publishable_key: self.secrets.stripe_publishable_key.clone(),
+        }))
     }
 
     /// Internal only, no end-user token -- see this RPC's own doc comment in
@@ -747,6 +918,34 @@ fn uuid_like() -> String {
 mod tests {
     use super::*;
     use crate::config::{Config, Secrets};
+
+    fn sub(status: &str) -> sub_db::SubscriptionRow {
+        sub_db::SubscriptionRow {
+            id: 1,
+            organization_id: "o".into(),
+            storefront: "developer".into(),
+            plan_code: "dev_pro".into(),
+            status: status.into(),
+            current_period_start: 0,
+            current_period_end: 0,
+            pending_plan_code: None,
+            cancel_at_period_end: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_canceled_subscription_never_becomes_the_orgs_overall_status() {
+        // Canceled ties with Active on severity; left in, it could win and
+        // make domain_management refuse an org that merely stopped a product.
+        for order in [["active", "canceled"], ["canceled", "active"]] {
+            let subs: Vec<_> = order.iter().map(|s| sub(s)).collect();
+            assert_eq!(most_severe_status(&subs), "active");
+        }
+        assert_eq!(most_severe_status(&[sub("canceled")]), "active");
+        assert_eq!(most_severe_status(&[sub("canceled"), sub("past_due")]), "past_due");
+    }
 
     fn unique_org() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
