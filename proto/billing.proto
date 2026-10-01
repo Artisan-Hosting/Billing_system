@@ -249,6 +249,15 @@ service BillingAdminService {
   // which one.
   rpc GetOrganizationBillingStatus(GetOrganizationBillingStatusRequest) returns (OrgBillingStatus);
 
+  // Internal only, no end-user token. Whether an organization may DEPLOY a new
+  // project right now. Unlike GetOrganizationBillingStatus (where "no
+  // subscriptions" reads as ACTIVE so a first purchase is not refused), this
+  // needs an actual plan: `entitled` is true only when the org holds a
+  // subscription in `storefront` that is ACTIVE or PAST_DUE. Callers gate
+  // fail-closed on it. The plan's allowances are not enforced (plans bill
+  // overage rather than block); that is a later change.
+  rpc GetOrganizationEntitlements(GetOrganizationEntitlementsRequest) returns (OrgEntitlements);
+
   // AUTHZ: access_token only (a read).
   rpc GetCreditBalance(GetCreditBalanceRequest) returns (CreditBalance);
 
@@ -556,4 +565,19 @@ message PreflightCreditCheckRequest {
 message PreflightCreditCheckResponse {
   bool sufficient = 1;
   int64 balance_cents = 2;   // for the caller's own logging/UI, not itself the pass/fail signal
+}
+
+message GetOrganizationEntitlementsRequest {
+  string organization_id = 1;
+  // e.g. "developer". Self-serve deploys are the developer storefront.
+  string storefront = 2;
+}
+
+message OrgEntitlements {
+  bool entitled = 1;
+  // Why not, written for the person who will read it. Empty when entitled.
+  string reason = 2;
+  // The qualifying subscription's plan, when entitled.
+  string plan_code = 3;
+  BillingStatus status = 4;
 }

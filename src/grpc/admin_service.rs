@@ -164,6 +164,42 @@ mod proto_status {
 /// at all is `Active` -- "never subscribed to anything" is not a reason to
 /// refuse the purchase that would create the first one (see
 /// `OrgBillingStatus`'s own proto doc comment).
+/// Whether `subscriptions` entitle the organization to deploy under `storefront`:
+/// a subscription there that is Active or Past Due (the same two states
+/// `domain_management` lets buy). A canceled, suspended, grace-period or deleted
+/// one does not; neither does having none. Pure so the rule is tested directly.
+fn entitlement_for(subscriptions: &[sub_db::SubscriptionRow], storefront: &str) -> OrgEntitlements {
+    let here: Vec<&sub_db::SubscriptionRow> = subscriptions.iter().filter(|s| s.storefront == storefront).collect();
+    if here.is_empty() {
+        return OrgEntitlements {
+            entitled: false,
+            reason: format!("no {storefront} plan: choose a plan to deploy"),
+            plan_code: String::new(),
+            status: proto_status::Unspecified as i32,
+        };
+    }
+    for s in &here {
+        match BillingStatus::from_str_name(&s.status) {
+            Ok(BillingStatus::Active) | Ok(BillingStatus::PastDue) => {
+                return OrgEntitlements {
+                    entitled: true,
+                    reason: String::new(),
+                    plan_code: s.plan_code.clone(),
+                    status: billing_status_to_i32(&s.status),
+                };
+            }
+            _ => {}
+        }
+    }
+    let worst = here[0];
+    OrgEntitlements {
+        entitled: false,
+        reason: "your plan is not in good standing: check Billing".to_owned(),
+        plan_code: worst.plan_code.clone(),
+        status: billing_status_to_i32(&worst.status),
+    }
+}
+
 fn most_severe_status(subscriptions: &[sub_db::SubscriptionRow]) -> &'static str {
     fn severity(status: &str) -> u8 {
         match BillingStatus::from_str_name(status) {
@@ -770,6 +806,22 @@ impl BillingAdminService for Billing {
         }))
     }
 
+    /// Internal only. See the RPC's doc comment in `proto/billing.proto`.
+    async fn get_organization_entitlements(
+        &self,
+        request: Request<GetOrganizationEntitlementsRequest>,
+    ) -> Result<Response<OrgEntitlements>, Status> {
+        let req = request.into_inner();
+        if req.organization_id.is_empty() {
+            return Err(Status::invalid_argument("organization_id is required"));
+        }
+        if req.storefront.is_empty() {
+            return Err(Status::invalid_argument("storefront is required"));
+        }
+        let rows = sub_db::list_for_org(&self.pool, &req.organization_id).await.map_err(Status::from)?;
+        Ok(Response::new(entitlement_for(&rows, &req.storefront)))
+    }
+
     async fn get_credit_balance(&self, request: Request<GetCreditBalanceRequest>) -> Result<Response<CreditBalance>, Status> {
         let req = request.into_inner();
         let claims = self.caller(&req.access_token).await?;
@@ -945,6 +997,42 @@ mod tests {
         }
         assert_eq!(most_severe_status(&[sub("canceled")]), "active");
         assert_eq!(most_severe_status(&[sub("canceled"), sub("past_due")]), "past_due");
+    }
+
+    fn sub_in(storefront: &str, status: &str) -> sub_db::SubscriptionRow {
+        let mut row = sub(status);
+        row.storefront = storefront.into();
+        row
+    }
+
+    #[test]
+    fn having_no_plan_in_the_storefront_is_not_entitled_even_though_the_overall_status_is_active() {
+        let none = entitlement_for(&[], "developer");
+        assert!(!none.entitled);
+        assert!(none.reason.contains("choose a plan"), "{}", none.reason);
+        // A plan in a different storefront does not count.
+        assert!(!entitlement_for(&[sub_in("email", "active")], "developer").entitled);
+    }
+
+    #[test]
+    fn only_active_and_past_due_plans_are_entitled() {
+        for ok in ["active", "past_due"] {
+            let e = entitlement_for(&[sub_in("developer", ok)], "developer");
+            assert!(e.entitled, "{ok}");
+            assert_eq!(e.plan_code, "dev_pro");
+            assert!(e.reason.is_empty());
+        }
+        for bad in ["grace_period", "suspended", "deleted", "canceled", "something_new"] {
+            let e = entitlement_for(&[sub_in("developer", bad)], "developer");
+            assert!(!e.entitled, "{bad}");
+            assert!(e.reason.contains("good standing"), "{}", e.reason);
+        }
+    }
+
+    #[test]
+    fn a_good_plan_wins_over_a_bad_one_in_the_same_storefront() {
+        let rows = [sub_in("developer", "suspended"), sub_in("developer", "active")];
+        assert!(entitlement_for(&rows, "developer").entitled);
     }
 
     fn unique_org() -> String {
