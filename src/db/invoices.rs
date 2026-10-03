@@ -330,3 +330,33 @@ mod tests {
         assert_eq!(invoice.status, "paid");
     }
 }
+
+use std::collections::HashSet;
+
+pub async fn subscriptions_with_paid_invoice(pool: &MySqlPool, subscription_ids: &[u64]) -> Result<HashSet<u64>> {
+    if subscription_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let placeholders: Vec<_> = (0..subscription_ids.len()).map(|_| "?").collect();
+    let placeholders_str = placeholders.join(",");
+
+    let query = format!(
+        "SELECT DISTINCT subscription_id FROM invoices WHERE status = 'paid' AND subscription_id IN ({})",
+        placeholders_str
+    );
+
+    let mut query_builder = sqlx::query(&query);
+    for id in subscription_ids {
+        query_builder = query_builder.bind(id);
+    }
+
+    let rows = query_builder.fetch_all(pool).await?;
+
+    let mut set = HashSet::new();
+    for row in rows {
+        let id: u64 = row.get("subscription_id");
+        set.insert(id);
+    }
+    Ok(set)
+}
