@@ -156,3 +156,9 @@ mod tests {
         assert!(err.to_string().contains("not found"), "{err}");
     }
 }
+
+/// Returns true if the plan's metadata contains `"invite_only": true`.
+/// Missing or malformed metadata is treated as not invite‑only.
+pub fn is_invite_only(metadata: &serde_json::Value) -> bool {
+    todo!()
+}

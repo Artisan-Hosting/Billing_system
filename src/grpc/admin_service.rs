@@ -1271,3 +1271,9 @@ mod derived_tests {
         assert!(!e.entitled);
     }
 }
+
+/// Determines whether a plan described by `metadata` is visible to a caller.
+/// Invite‑only plans are only visible to Super users.
+pub fn visible_to(metadata: &serde_json::Value, is_super: bool) -> bool {
+    todo!()
+}
