@@ -169,7 +169,7 @@ mod proto_status {
 /// a subscription there that is Active or Past Due (the same two states
 /// `domain_management` lets buy). A canceled, suspended, grace-period or deleted
 /// one does not; neither does having none. Pure so the rule is tested directly.
-fn entitlement_for(subscriptions: &[sub_db::SubscriptionRow], storefront: &str, paid_subscriptions: &std::collections::HashSet<u64>) -> OrgEntitlements {
+fn entitlement_for(subscriptions: &[sub_db::SubscriptionRow], storefront: &str, paid_subscriptions: &HashSet<u64>) -> OrgEntitlements {
     let here: Vec<&sub_db::SubscriptionRow> = subscriptions.iter().filter(|s| s.storefront == storefront).collect();
     if here.is_empty() {
         return OrgEntitlements {
@@ -181,13 +181,30 @@ fn entitlement_for(subscriptions: &[sub_db::SubscriptionRow], storefront: &str, 
     }
     for s in &here {
         match BillingStatus::from_str_name(&s.status) {
-            Ok(BillingStatus::Active) | Ok(BillingStatus::PastDue) => {
+            Ok(BillingStatus::Active) => {
                 return OrgEntitlements {
                     entitled: true,
                     reason: String::new(),
                     plan_code: s.plan_code.clone(),
                     status: billing_status_to_i32(&s.status),
                 };
+            }
+            Ok(BillingStatus::PastDue) => {
+                if paid_subscriptions.contains(&s.id) {
+                    return OrgEntitlements {
+                        entitled: true,
+                        reason: String::new(),
+                        plan_code: s.plan_code.clone(),
+                        status: billing_status_to_i32(&s.status),
+                    };
+                } else {
+                    return OrgEntitlements {
+                        entitled: false,
+                        reason: "waiting for your first payment".to_owned(),
+                        plan_code: s.plan_code.clone(),
+                        status: billing_status_to_i32(&s.status),
+                    };
+                }
             }
             _ => {}
         }
@@ -1020,12 +1037,12 @@ mod tests {
 
     #[test]
     fn only_active_and_past_due_plans_are_entitled() {
-        for ok in ["active", "past_due"] {
-            let e = entitlement_for(&[sub_in("developer", ok)], "developer", &HashSet::new());
-            assert!(e.entitled, "{ok}");
-            assert_eq!(e.plan_code, "dev_pro");
-            assert!(e.reason.is_empty());
-        }
+        // active is always entitled; past_due requires a paid invoice (tested in derived_tests)
+        let e = entitlement_for(&[sub_in("developer", "active")], "developer", &HashSet::new());
+        assert!(e.entitled);
+        assert_eq!(e.plan_code, "dev_pro");
+        assert!(e.reason.is_empty());
+
         for bad in ["grace_period", "suspended", "deleted", "canceled", "something_new"] {
             let e = entitlement_for(&[sub_in("developer", bad)], "developer", &HashSet::new());
             assert!(!e.entitled, "{bad}");
