@@ -431,6 +431,9 @@ impl BillingAdminService for Billing {
                 req.plan_code, plan.storefront, req.storefront
             )));
         }
+        if plans_db::is_invite_only(&plan.metadata) && claims.role != Role::Super {
+            return Err(Status::failed_precondition("This plan is by invitation only"));
+        }
 
         let found = sub_db::find(&self.pool, &organization_id, &req.storefront).await.map_err(Status::from)?;
         // A subscription whose cancellation already ran out is bought afresh
@@ -670,13 +673,17 @@ impl BillingAdminService for Billing {
     /// Any signed-in caller: the catalog is the public Price Book.
     async fn list_plans(&self, request: Request<ListPlansRequest>) -> Result<Response<ListPlansResponse>, Status> {
         let req = request.into_inner();
-        self.caller(&req.access_token).await?;
+        let claims = self.caller(&req.access_token).await?;
+        let is_super = claims.role == Role::Super;
 
         let storefront = if req.storefront.is_empty() { None } else { Some(req.storefront.as_str()) };
         let rows = plans_db::list_active(&self.pool, storefront).await.map_err(Status::from)?;
 
         let mut plans = Vec::with_capacity(rows.len());
         for row in rows {
+            if !visible_to(&row.metadata, is_super) {
+                continue;
+            }
             let catalog = plans_db::allowances_and_rates_for_plan(&self.pool, &row.plan_code)
                 .await
                 .map_err(Status::from)?;
@@ -1270,4 +1277,13 @@ mod derived_tests {
         let e = entitlement_for(&subs, "developer", &paid);
         assert!(!e.entitled);
     }
+}
+
+/// Determines whether a plan described by `metadata` is visible to a caller.
+/// Invite‑only plans are only visible to Super users.
+pub fn visible_to(metadata: &serde_json::Value, is_super: bool) -> bool {
+    if is_super {
+        return true;
+    }
+    !crate::db::plans::is_invite_only(metadata)
 }

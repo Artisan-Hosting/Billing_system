@@ -23,11 +23,12 @@ pub struct PlanRow {
     pub price_cents: i64,
     pub currency: String,
     pub active: bool,
+    pub metadata: serde_json::Value,
 }
 
 pub async fn find(pool: &MySqlPool, plan_code: &str) -> Result<Option<PlanRow>> {
     let row = sqlx::query(
-        "SELECT plan_code, storefront, display_name, price_cents, currency, active FROM plans WHERE plan_code = ?",
+        "SELECT plan_code, storefront, display_name, price_cents, currency, active, metadata FROM plans WHERE plan_code = ?",
     )
     .bind(plan_code)
     .fetch_optional(pool)
@@ -40,13 +41,14 @@ pub async fn find(pool: &MySqlPool, plan_code: &str) -> Result<Option<PlanRow>> 
         price_cents: row.get("price_cents"),
         currency: row.get("currency"),
         active: row.get("active"),
+        metadata: row.get("metadata"),
     }))
 }
 
 /// Every plan still on sale, cheapest first within a storefront.
 pub async fn list_active(pool: &MySqlPool, storefront: Option<&str>) -> Result<Vec<PlanRow>> {
     let rows = sqlx::query(
-        "SELECT plan_code, storefront, display_name, price_cents, currency, active FROM plans \
+        "SELECT plan_code, storefront, display_name, price_cents, currency, active, metadata FROM plans \
          WHERE active = TRUE AND (? IS NULL OR storefront = ?) ORDER BY storefront, price_cents, plan_code",
     )
     .bind(storefront)
@@ -63,6 +65,7 @@ pub async fn list_active(pool: &MySqlPool, storefront: Option<&str>) -> Result<V
             price_cents: row.get("price_cents"),
             currency: row.get("currency"),
             active: row.get("active"),
+            metadata: row.get("metadata"),
         })
         .collect())
 }
@@ -155,4 +158,14 @@ mod tests {
         let err = allowances_and_rates_for_plan(&pool, "no_such_plan").await.unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
     }
+}
+
+/// Returns true if the plan's metadata contains `"invite_only": true`.
+/// Missing or malformed metadata is treated as not invite‑only.
+pub fn is_invite_only(metadata: &serde_json::Value) -> bool {
+    metadata
+        .as_object()
+        .and_then(|o| o.get("invite_only"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
