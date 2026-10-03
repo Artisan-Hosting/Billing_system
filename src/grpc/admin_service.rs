@@ -18,6 +18,7 @@ use crate::domain::BillingStatus;
 use crate::grpc::service::Billing;
 use crate::proto::billing::*;
 use crate::proto::billing::billing_admin_service_server::BillingAdminService;
+use std::collections::HashSet;
 // `create_payment_intent` is a `BillingService` trait method reused
 // in-process (see `finalize_invoice_and_maybe_charge`'s own comment) --
 // needs the trait in scope even though this file implements the *other*
@@ -168,7 +169,7 @@ mod proto_status {
 /// a subscription there that is Active or Past Due (the same two states
 /// `domain_management` lets buy). A canceled, suspended, grace-period or deleted
 /// one does not; neither does having none. Pure so the rule is tested directly.
-fn entitlement_for(subscriptions: &[sub_db::SubscriptionRow], storefront: &str) -> OrgEntitlements {
+fn entitlement_for(subscriptions: &[sub_db::SubscriptionRow], storefront: &str, paid_subscriptions: &std::collections::HashSet<u64>) -> OrgEntitlements {
     let here: Vec<&sub_db::SubscriptionRow> = subscriptions.iter().filter(|s| s.storefront == storefront).collect();
     if here.is_empty() {
         return OrgEntitlements {
@@ -819,7 +820,9 @@ impl BillingAdminService for Billing {
             return Err(Status::invalid_argument("storefront is required"));
         }
         let rows = sub_db::list_for_org(&self.pool, &req.organization_id).await.map_err(Status::from)?;
-        Ok(Response::new(entitlement_for(&rows, &req.storefront)))
+        let sub_ids: Vec<u64> = rows.iter().map(|s| s.id).collect();
+        let paid_set = inv_db::subscriptions_with_paid_invoice(&self.pool, &sub_ids).await.map_err(Status::from)?;
+        Ok(Response::new(entitlement_for(&rows, &req.storefront, &paid_set)))
     }
 
     async fn get_credit_balance(&self, request: Request<GetCreditBalanceRequest>) -> Result<Response<CreditBalance>, Status> {
@@ -969,6 +972,7 @@ fn uuid_like() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use crate::config::{Config, Secrets};
 
     fn sub(status: &str) -> sub_db::SubscriptionRow {
@@ -1007,23 +1011,23 @@ mod tests {
 
     #[test]
     fn having_no_plan_in_the_storefront_is_not_entitled_even_though_the_overall_status_is_active() {
-        let none = entitlement_for(&[], "developer");
+        let none = entitlement_for(&[], "developer", &HashSet::new());
         assert!(!none.entitled);
         assert!(none.reason.contains("choose a plan"), "{}", none.reason);
         // A plan in a different storefront does not count.
-        assert!(!entitlement_for(&[sub_in("email", "active")], "developer").entitled);
+        assert!(!entitlement_for(&[sub_in("email", "active")], "developer", &HashSet::new()).entitled);
     }
 
     #[test]
     fn only_active_and_past_due_plans_are_entitled() {
         for ok in ["active", "past_due"] {
-            let e = entitlement_for(&[sub_in("developer", ok)], "developer");
+            let e = entitlement_for(&[sub_in("developer", ok)], "developer", &HashSet::new());
             assert!(e.entitled, "{ok}");
             assert_eq!(e.plan_code, "dev_pro");
             assert!(e.reason.is_empty());
         }
         for bad in ["grace_period", "suspended", "deleted", "canceled", "something_new"] {
-            let e = entitlement_for(&[sub_in("developer", bad)], "developer");
+            let e = entitlement_for(&[sub_in("developer", bad)], "developer", &HashSet::new());
             assert!(!e.entitled, "{bad}");
             assert!(e.reason.contains("good standing"), "{}", e.reason);
         }
@@ -1032,7 +1036,7 @@ mod tests {
     #[test]
     fn a_good_plan_wins_over_a_bad_one_in_the_same_storefront() {
         let rows = [sub_in("developer", "suspended"), sub_in("developer", "active")];
-        assert!(entitlement_for(&rows, "developer").entitled);
+        assert!(entitlement_for(&rows, "developer", &HashSet::new()).entitled);
     }
 
     fn unique_org() -> String {
@@ -1187,5 +1191,66 @@ mod tests {
         });
         let resp = billing.preflight_credit_check(req).await.expect("preflight_credit_check").into_inner();
         assert!(!resp.sufficient);
+    }
+}
+
+#[cfg(test)]
+mod derived_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn sub_with_id(id: u64, status: &str) -> sub_db::SubscriptionRow {
+        sub_db::SubscriptionRow {
+            id,
+            organization_id: "org".into(),
+            storefront: "developer".into(),
+            plan_code: "dev_pro".into(),
+            status: status.into(),
+            current_period_start: 0,
+            current_period_end: 0,
+            pending_plan_code: None,
+            cancel_at_period_end: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn past_due_without_paid_invoice_is_not_entitled() {
+        let sub = sub_with_id(1, "past_due");
+        let subs = vec![sub];
+        let paid = HashSet::new();
+        let e = entitlement_for(&subs, "developer", &paid);
+        assert!(!e.entitled);
+        assert_eq!(e.reason, "waiting for your first payment");
+    }
+
+    #[test]
+    fn past_due_with_paid_invoice_is_entitled() {
+        let sub = sub_with_id(2, "past_due");
+        let subs = vec![sub];
+        let mut paid = HashSet::new();
+        paid.insert(2);
+        let e = entitlement_for(&subs, "developer", &paid);
+        assert!(e.entitled);
+        assert!(e.reason.is_empty());
+    }
+
+    #[test]
+    fn active_is_always_entitled() {
+        let sub = sub_with_id(3, "active");
+        let subs = vec![sub];
+        let paid = HashSet::new();
+        let e = entitlement_for(&subs, "developer", &paid);
+        assert!(e.entitled);
+    }
+
+    #[test]
+    fn canceled_is_not_entitled() {
+        let sub = sub_with_id(4, "canceled");
+        let subs = vec![sub];
+        let paid = HashSet::new();
+        let e = entitlement_for(&subs, "developer", &paid);
+        assert!(!e.entitled);
     }
 }

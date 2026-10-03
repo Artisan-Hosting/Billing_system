@@ -330,3 +330,10 @@ mod tests {
         assert_eq!(invoice.status, "paid");
     }
 }
+
+use std::collections::HashSet;
+
+pub async fn subscriptions_with_paid_invoice(pool: &MySqlPool, subscription_ids: &[u64]) -> Result<HashSet<u64>> {
+    // Returns the set of subscription IDs that have at least one paid invoice.
+    todo!()
+}
