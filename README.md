@@ -47,4 +47,6 @@ make check     # fmt-check + clippy + test
 ```
 
 Migrations live in `migrations/` and are applied by hand (`serve` and
-`billing migrate` do not run them).
+`billing migrate` do not run them); `0008_invoices_subscription_status_idx.sql`
+adds the `(subscription_id, status)` index for the paid-invoice lookup and, like
+every migration, is applied by hand.
